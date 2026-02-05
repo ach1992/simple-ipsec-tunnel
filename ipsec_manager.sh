@@ -23,6 +23,7 @@ set -Eeuo pipefail
 #   - sysctl persist: ip_forward + rp_filter disabled for tunnel interfaces
 # ============================================================
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 APP_NAME="Simple IPsec Tunnel"
 REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
