@@ -1,48 +1,55 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# =========================
-#  Simple IPsec Tunnel - IPsec VTI Manager (Multi Tunnel)
+# ============================================================
+#  Simple IPsec Tunnel (IKEv2 + VTI) - Multi Tunnel Manager
 #  Repo: https://github.com/ach1992/simple-ipsec-tunnel
-# =========================
-# Debian/Ubuntu friendly (systemd)
-# Features:
-# - Create/Edit/Status/Info/Delete MULTIPLE IPsec(VTI) tunnels
-# - Per-tunnel configs in /etc/simple-ipsec/tunnels.d/<tun>.conf
-# - systemd template: simple-ipsec@<tun>.service
-# - Route-based IPsec with VTI interface (gives you /30 local IP like GRE)
-# - COPY BLOCK output per tunnel
-# - Persists sysctl: ip_forward + rp_filter off (recommended for VTI/IPsec)
 #
-# Notes:
-# - Requires UDP/500 and UDP/4500 reachable (IKE/NAT-T)
-# - Uses strongSwan (ipsec/strongswan-starter)
+#  Goal: GRE-like experience:
+#   - Per-tunnel interface (vtiX)
+#   - Local /30 tunnel IPs derived from PAIR CODE (10.X.Y)
+#   - Multi tunnel
+#   - Create / Edit (rename) / Status / Info / List / Delete
+#   - COPY BLOCK to mirror settings on the other server
+#
+#  Tech:
+#   - strongSwan (ipsec)
+#   - Route-based IPsec: installpolicy=no + mark
+#   - Linux VTI interface: ip link add vtiX type vti ... key MARK
+#
+#  Safety:
+#   - secrets stored per tunnel with BEGIN/END markers (safe for same peer)
+#   - robust rename: stops old service, removes old interface, removes old conn+secrets+conf
+#   - sysctl persist: ip_forward + rp_filter disabled for tunnel interfaces
+# ============================================================
+
+APP_NAME="Simple IPsec Tunnel"
+REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
 SYSCTL_FILE="$APP_DIR/99-simple-ipsec.conf"
 
 IPSEC_INCLUDE_DIR="/etc/ipsec.d/simple-ipsec"
-IPSEC_INCLUDE_CONF="/etc/ipsec.conf"
-IPSEC_INCLUDE_SECRETS="/etc/ipsec.secrets"
+IPSEC_CONF="/etc/ipsec.conf"
+IPSEC_SECRETS="/etc/ipsec.secrets"
+SECRETS_FILE="/etc/ipsec.d/simple-ipsec.secrets"
 
-SERVICE_TEMPLATE_FILE="/etc/systemd/system/simple-ipsec@.service"
-
-REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
-APP_NAME="Simple IPsec Tunnel"
+SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec@.service"
+UP_HELPER="/usr/local/sbin/simple-ipsec-up"
+DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MARK_DEFAULT_MIN=10
-MARK_DEFAULT_MAX=999999
-MTU_DEFAULT="1436" # safe default for IPsec over UDP; adjust if needed
+MTU_DEFAULT="1436"     # safe-ish default for ESP-in-UDP (NAT-T); adjust if needed
+MARK_MIN=10
+MARK_MAX=999999
 ENABLE_FORWARDING_DEFAULT="yes"
 DISABLE_RPFILTER_DEFAULT="yes"
 
 # Colors
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
 MAG="\033[0;35m"; CYA="\033[0;36m"; WHT="\033[1;37m"; NC="\033[0m"
-
 log()   { echo -e "${BLU}[INFO]${NC} $*"; }
 ok()    { echo -e "${GRN}[OK]${NC} $*"; }
 warn()  { echo -e "${YEL}[WARN]${NC} $*"; }
@@ -51,7 +58,7 @@ pause() { read -r -p "Press Enter to continue..." _; }
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "This script must be run as root."
+    err "Run as root."
     exit 1
   fi
 }
@@ -63,12 +70,10 @@ require_cmds() {
   for c in ip awk sed grep sysctl systemctl ping; do
     have_cmd "$c" || missing+=("$c")
   done
-  if ! have_cmd ipsec; then
-    missing+=("strongswan (ipsec)")
-  fi
+  have_cmd ipsec || missing+=("strongswan (ipsec)")
   if ((${#missing[@]})); then
     err "Missing required commands: ${missing[*]}"
-    err "Install on Debian/Ubuntu:"
+    err "Debian/Ubuntu install:"
     err "  apt-get update && apt-get install -y strongswan iproute2 iputils-ping"
     exit 1
   fi
@@ -76,10 +81,14 @@ require_cmds() {
 
 ensure_dirs() {
   mkdir -p "$APP_DIR" "$TUNNELS_DIR" "$IPSEC_INCLUDE_DIR"
-  chmod 700 "$APP_DIR" "$TUNNELS_DIR" || true
-  chmod 700 "$IPSEC_INCLUDE_DIR" || true
+  chmod 700 "$APP_DIR" "$TUNNELS_DIR" "$IPSEC_INCLUDE_DIR" || true
+  touch "$SECRETS_FILE"
+  chmod 600 "$SECRETS_FILE"
 }
 
+# -----------------------
+# Validation helpers
+# -----------------------
 is_ipv4() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -107,226 +116,64 @@ get_iface_ip() {
   ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1
 }
 
-conf_path_for() {
-  local tun="$1"
-  echo "$TUNNELS_DIR/${tun}.conf"
+# -----------------------
+# Paths / naming
+# -----------------------
+conf_path_for() { echo "$TUNNELS_DIR/${1}.conf"; }
+conn_name_for() { echo "simple-ipsec-${1}"; }
+ipsec_conn_conf_for() { echo "$IPSEC_INCLUDE_DIR/${1}.conf"; }
+service_for() { echo "simple-ipsec@${1}.service"; }
+
+# -----------------------
+# Tunnel list / choose
+# -----------------------
+list_tunnels() {
+  shopt -s nullglob
+  for f in "$TUNNELS_DIR"/*.conf; do
+    basename "$f" .conf
+  done
+  shopt -u nullglob
 }
 
-service_for() {
-  local tun="$1"
-  echo "simple-ipsec@${tun}.service"
-}
+choose_tunnel() {
+  mapfile -t tunnels < <(list_tunnels)
+  ((${#tunnels[@]})) || { err "No tunnels found."; return 1; }
 
-conn_name_for() {
-  local tun="$1"
-  echo "simple-ipsec-${tun}"
-}
+  echo -e "${MAG}Available tunnels:${NC}"
+  local i
+  for i in "${!tunnels[@]}"; do
+    printf "  %s) %s\n" "$((i+1))" "${tunnels[$i]}"
+  done
 
-ipsec_conn_conf_for() {
-  local tun="$1"
-  echo "$IPSEC_INCLUDE_DIR/${tun}.conf"
-}
-
-# -------------------------
-# Name auto-pick (vtiN)
-# -------------------------
-name_taken() {
-  local tun="$1"
-  [[ -f "$(conf_path_for "$tun")" ]] && return 0
-  ip link show "$tun" >/dev/null 2>&1 && return 0
-  return 1
-}
-
-find_first_free_vti_name() {
-  local base="${1:-vti}"
-  local i=0
-  local cand
+  local choice
   while true; do
-    cand="${base}${i}"
-    if ! name_taken "$cand"; then
-      echo "$cand"
+    read -r -p "Select tunnel [1-${#tunnels[@]}] (Enter=cancel): " choice || true
+    [[ -n "${choice:-}" ]] || return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#tunnels[@]} )); then
+      SELECTED_TUN="${tunnels[$((choice-1))]}"
       return 0
     fi
-    i=$((i+1))
-    if (( i > 4096 )); then
-      return 1
-    fi
+    err "Invalid selection."
   done
 }
 
-# -------------------------
-# PAIR CODE (10.X.Y) -> /30
-# -------------------------
-generate_pair_code() {
-  local rx ry
-  rx=$(( (RANDOM % 254) + 1 ))
-  ry=$(( (RANDOM % 254) + 1 ))
-  echo "10.${rx}.${ry}"
-}
-
-parse_pair_code() {
-  local pc="$1"
-  if [[ ! "$pc" =~ ^10\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-    return 1
-  fi
-  local x="${BASH_REMATCH[1]}" y="${BASH_REMATCH[2]}"
-  [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]] || return 1
-  (( x >= 0 && x <= 255 && y >= 0 && y <= 255 )) || return 1
-  echo "$x $y"
-}
-
-recompute_tunnel_ips_from_pair() {
-  local parsed rx ry
-  parsed="$(parse_pair_code "${PAIR_CODE}")" || { err "PAIR_CODE is invalid."; return 1; }
-  rx="${parsed% *}"; ry="${parsed#* }"
-
-  if [[ "${ROLE}" == "source" ]]; then
-    TUN_LOCAL_CIDR="10.${rx}.${ry}.1/30"
-    TUN_REMOTE_IP="10.${rx}.${ry}.2"
-  else
-    TUN_LOCAL_CIDR="10.${rx}.${ry}.2/30"
-    TUN_REMOTE_IP="10.${rx}.${ry}.1"
-  fi
-  return 0
-}
-
-# -------------------------
-# COPY BLOCK
-# -------------------------
-print_copy_block() {
-  local src_ip dst_ip
-  if [[ "${ROLE}" == "source" ]]; then
-    src_ip="${LOCAL_WAN_IP}"
-    dst_ip="${REMOTE_WAN_IP}"
-  else
-    src_ip="${REMOTE_WAN_IP}"
-    dst_ip="${LOCAL_WAN_IP}"
-  fi
-
-  echo "----- SIMPLE_IPSEC_COPY_BLOCK -----"
-  echo "PAIR_CODE=${PAIR_CODE}"
-  echo "SOURCE_PUBLIC_IP=${src_ip}"
-  echo "DEST_PUBLIC_IP=${dst_ip}"
-  echo "TUN_NAME=${TUN_NAME}"
-  echo "MARK=${MARK}"
-  echo "MTU=${MTU}"
-  echo "ENABLE_FORWARDING=${ENABLE_FORWARDING}"
-  echo "DISABLE_RPFILTER=${DISABLE_RPFILTER}"
-  echo "PSK=${PSK}"
-  echo "----- END_COPY_BLOCK -----"
-}
-
-prompt_paste_copy_block() {
-  echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
-  echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
-  echo
-
-  local first=""
-  read -r -p "Paste first line (or just Enter to skip): " first || true
-  if [[ -z "${first:-}" ]]; then
-    return 0
-  fi
-
-  local lines=()
-  lines+=("$first")
-
-  local empty_count=0
-  while true; do
-    local line=""
-    read -r line || true
-
-    if [[ -z "${line:-}" ]]; then
-      empty_count=$((empty_count + 1))
-      if (( empty_count >= 2 )); then
-        break
-      fi
-      continue
-    fi
-
-    empty_count=0
-    lines+=("$line")
-  done
-
-  local kv key val
-  for kv in "${lines[@]}"; do
-    [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
-    key="${kv%%=*}"
-    val="${kv#*=}"
-    case "$key" in
-      PAIR_CODE) PAIR_CODE="$val" ;;
-      SOURCE_PUBLIC_IP) PASTE_SOURCE_PUBLIC_IP="$val" ;;
-      DEST_PUBLIC_IP)   PASTE_DEST_PUBLIC_IP="$val" ;;
-      TUN_NAME) TUN_NAME="$val" ;;
-      MARK) MARK="$val" ;;
-      MTU) MTU="$val" ;;
-      ENABLE_FORWARDING) ENABLE_FORWARDING="$val" ;;
-      DISABLE_RPFILTER)  DISABLE_RPFILTER="$val" ;;
-      PSK) PSK="$val" ;;
-      *) : ;;
-    esac
-  done
-
-  if [[ -n "${PAIR_CODE:-}" ]] && ! parse_pair_code "$PAIR_CODE" >/dev/null; then
-    err "Pasted PAIR_CODE is invalid."
-    return 1
-  fi
-  if [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" ]] && ! is_ipv4 "$PASTE_SOURCE_PUBLIC_IP"; then
-    err "Pasted SOURCE_PUBLIC_IP is invalid."
-    return 1
-  fi
-  if [[ -n "${PASTE_DEST_PUBLIC_IP:-}" ]] && ! is_ipv4 "$PASTE_DEST_PUBLIC_IP"; then
-    err "Pasted DEST_PUBLIC_IP is invalid."
-    return 1
-  fi
-  if [[ -n "${TUN_NAME:-}" ]] && ! is_ifname "$TUN_NAME"; then
-    err "Pasted TUN_NAME is invalid."
-    return 1
-  fi
-  if [[ -n "${MARK:-}" ]]; then
-    [[ "$MARK" =~ ^[0-9]+$ ]] || { err "Pasted MARK must be numeric."; return 1; }
-    (( MARK >= 1 && MARK <= 2147483647 )) || { err "Pasted MARK out of range."; return 1; }
-  fi
-  if [[ -n "${MTU:-}" ]]; then
-    [[ "$MTU" =~ ^[0-9]+$ ]] || { err "Pasted MTU must be numeric."; return 1; }
-    (( MTU >= 1200 && MTU <= 9000 )) || { err "Pasted MTU out of range."; return 1; }
-  fi
-  if [[ -n "${ENABLE_FORWARDING:-}" ]] && [[ "$ENABLE_FORWARDING" != "yes" && "$ENABLE_FORWARDING" != "no" ]]; then
-    err "Pasted ENABLE_FORWARDING must be 'yes' or 'no'."
-    return 1
-  fi
-  if [[ -n "${DISABLE_RPFILTER:-}" ]] && [[ "$DISABLE_RPFILTER" != "yes" && "$DISABLE_RPFILTER" != "no" ]]; then
-    err "Pasted DISABLE_RPFILTER must be 'yes' or 'no'."
-    return 1
-  fi
-  if [[ -n "${PSK:-}" ]] && ((${#PSK} < 8)); then
-    err "Pasted PSK looks too short."
-    return 1
-  fi
-
-  ok "COPY BLOCK parsed successfully."
-  return 0
-}
-
-# -------------------------
-# Config I/O
-# -------------------------
+# -----------------------
+# Read/Write per tunnel conf
+# -----------------------
 read_conf() {
-  local tun="$1"
   local f
-  f="$(conf_path_for "$tun")"
+  f="$(conf_path_for "$1")"
   [[ -f "$f" ]] || return 1
   # shellcheck disable=SC1090
   source "$f"
-  return 0
 }
 
 write_conf() {
   local tun="$1"
   local f
   f="$(conf_path_for "$tun")"
-  ensure_dirs
   cat >"$f" <<EOF
-# Generated by simple-ipsec (multi tunnel)
+# Generated by simple-ipsec
 ROLE="${ROLE}"
 PAIR_CODE="${PAIR_CODE}"
 TUN_NAME="${TUN_NAME}"
@@ -343,135 +190,189 @@ EOF
   chmod 600 "$f"
 }
 
-list_tunnels() {
-  ensure_dirs
-  local f base
-  shopt -s nullglob
-  for f in "$TUNNELS_DIR"/*.conf; do
-    base="$(basename "$f")"
-    echo "${base%.conf}"
-  done
-  shopt -u nullglob
+# -----------------------
+# Name handling (auto vtiN)
+# -----------------------
+name_taken_anywhere() {
+  local name="$1"
+  [[ -f "$(conf_path_for "$name")" ]] && return 0
+  ip link show "$name" >/dev/null 2>&1 && return 0
+  return 1
 }
 
-choose_tunnel() {
-  local tunnels=()
-  local t
-  while IFS= read -r t; do
-    [[ -n "$t" ]] && tunnels+=("$t")
-  done < <(list_tunnels)
+find_first_free_vti_name() {
+  local base="${1:-vti}" i=0 cand
+  while true; do
+    cand="${base}${i}"
+    if ! name_taken_anywhere "$cand"; then
+      echo "$cand"; return 0
+    fi
+    i=$((i+1))
+    (( i <= 4096 )) || return 1
+  done
+}
 
-  if ((${#tunnels[@]} == 0)); then
-    err "No tunnels found."
-    return 1
+# -----------------------
+# PAIR CODE -> /30
+# -----------------------
+generate_pair_code() { echo "10.$(( (RANDOM%254)+1 )).$(( (RANDOM%254)+1 ))"; }
+
+parse_pair_code() {
+  local pc="$1"
+  [[ "$pc" =~ ^10\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local x="${BASH_REMATCH[1]}" y="${BASH_REMATCH[2]}"
+  (( x>=0 && x<=255 && y>=0 && y<=255 )) || return 1
+  echo "$x $y"
+}
+
+recompute_tunnel_ips_from_pair() {
+  local parsed rx ry
+  parsed="$(parse_pair_code "$PAIR_CODE")" || { err "PAIR_CODE invalid."; return 1; }
+  rx="${parsed% *}"; ry="${parsed#* }"
+
+  if [[ "$ROLE" == "source" ]]; then
+    TUN_LOCAL_CIDR="10.${rx}.${ry}.1/30"
+    TUN_REMOTE_IP="10.${rx}.${ry}.2"
+  else
+    TUN_LOCAL_CIDR="10.${rx}.${ry}.2/30"
+    TUN_REMOTE_IP="10.${rx}.${ry}.1"
+  fi
+}
+
+# -----------------------
+# COPY BLOCK
+# -----------------------
+print_copy_block() {
+  local src dst
+  if [[ "$ROLE" == "source" ]]; then
+    src="$LOCAL_WAN_IP"; dst="$REMOTE_WAN_IP"
+  else
+    src="$REMOTE_WAN_IP"; dst="$LOCAL_WAN_IP"
   fi
 
-  echo -e "${MAG}Available tunnels:${NC}"
-  local i
-  for i in "${!tunnels[@]}"; do
-    printf "  %s) %s\n" "$((i+1))" "${tunnels[$i]}"
-  done
+  echo "----- SIMPLE_IPSEC_COPY_BLOCK -----"
+  echo "PAIR_CODE=${PAIR_CODE}"
+  echo "SOURCE_PUBLIC_IP=${src}"
+  echo "DEST_PUBLIC_IP=${dst}"
+  echo "TUN_NAME=${TUN_NAME}"
+  echo "MARK=${MARK}"
+  echo "MTU=${MTU}"
+  echo "ENABLE_FORWARDING=${ENABLE_FORWARDING}"
+  echo "DISABLE_RPFILTER=${DISABLE_RPFILTER}"
+  echo "PSK=${PSK}"
+  echo "----- END_COPY_BLOCK -----"
+}
 
-  local choice
+prompt_paste_copy_block() {
+  echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
+  echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
+  echo
+
+  local first=""
+  read -r -p "Paste first line (or just Enter to skip): " first || true
+  [[ -n "${first:-}" ]] || return 0
+
+  local lines=("$first") empty_count=0 line
   while true; do
-    read -r -p "Select tunnel [1-${#tunnels[@]}] (Enter=cancel): " choice || true
-    if [[ -z "${choice:-}" ]]; then
-      return 1
+    line=""
+    read -r line || true
+    if [[ -z "${line:-}" ]]; then
+      empty_count=$((empty_count+1))
+      (( empty_count>=2 )) && break
+      continue
     fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#tunnels[@]} )); then
-      SELECTED_TUN="${tunnels[$((choice-1))]}"
-      return 0
-    fi
-    err "Invalid selection."
+    empty_count=0
+    lines+=("$line")
   done
+
+  local kv key val
+  for kv in "${lines[@]}"; do
+    [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
+    key="${kv%%=*}"; val="${kv#*=}"
+    case "$key" in
+      PAIR_CODE) PAIR_CODE="$val" ;;
+      SOURCE_PUBLIC_IP) PASTE_SOURCE_PUBLIC_IP="$val" ;;
+      DEST_PUBLIC_IP)   PASTE_DEST_PUBLIC_IP="$val" ;;
+      TUN_NAME) TUN_NAME="$val" ;;
+      MARK) MARK="$val" ;;
+      MTU) MTU="$val" ;;
+      ENABLE_FORWARDING) ENABLE_FORWARDING="$val" ;;
+      DISABLE_RPFILTER)  DISABLE_RPFILTER="$val" ;;
+      PSK) PSK="$val" ;;
+      *) : ;;
+    esac
+  done
+
+  # validate lightly (hard validate later in prompts)
+  [[ -z "${PAIR_CODE:-}" ]] || parse_pair_code "$PAIR_CODE" >/dev/null || { err "Bad PAIR_CODE in COPY BLOCK."; return 1; }
+  [[ -z "${PASTE_SOURCE_PUBLIC_IP:-}" ]] || is_ipv4 "$PASTE_SOURCE_PUBLIC_IP" || { err "Bad SOURCE_PUBLIC_IP in COPY BLOCK."; return 1; }
+  [[ -z "${PASTE_DEST_PUBLIC_IP:-}" ]] || is_ipv4 "$PASTE_DEST_PUBLIC_IP" || { err "Bad DEST_PUBLIC_IP in COPY BLOCK."; return 1; }
+  [[ -z "${TUN_NAME:-}" ]] || is_ifname "$TUN_NAME" || { err "Bad TUN_NAME in COPY BLOCK."; return 1; }
+  [[ -z "${MARK:-}" ]] || [[ "$MARK" =~ ^[0-9]+$ ]] || { err "Bad MARK in COPY BLOCK."; return 1; }
+  [[ -z "${MTU:-}" ]] || [[ "$MTU" =~ ^[0-9]+$ ]] || { err "Bad MTU in COPY BLOCK."; return 1; }
+
+  ok "COPY BLOCK parsed."
+  return 0
 }
 
-# -------------------------
-# Sysctl persist (global)
-# -------------------------
-compute_global_forwarding_needed() {
-  local t need="no"
-  while IFS= read -r t; do
-    [[ -z "$t" ]] && continue
-    if read_conf "$t"; then
-      if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
-        need="yes"; break
-      fi
-    fi
-  done < <(list_tunnels)
-  echo "$need"
+# -----------------------
+# Secrets (multi-safe)
+# -----------------------
+secrets_marker_begin() { echo "# BEGIN simple-ipsec:${1}"; }
+secrets_marker_end()   { echo "# END simple-ipsec:${1}"; }
+
+remove_secrets_block() {
+  local tun="$1"
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  sed -i "\|^# BEGIN simple-ipsec:${tun}\$|,\|^# END simple-ipsec:${tun}\$|d" "$SECRETS_FILE" || true
 }
 
-compute_rpfilter_needed() {
-  local t need="no"
-  while IFS= read -r t; do
-    [[ -z "$t" ]] && continue
-    if read_conf "$t"; then
-      if [[ "${DISABLE_RPFILTER:-no}" == "yes" ]]; then
-        need="yes"; break
-      fi
-    fi
-  done < <(list_tunnels)
-  echo "$need"
-}
+write_ipsec_secrets_block() {
+  local tun="$1"
+  remove_secrets_block "$tun"
 
-write_sysctl_persist() {
-  ensure_dirs
-  local forwarding_needed rp_needed
-  forwarding_needed="$(compute_global_forwarding_needed)"
-  rp_needed="$(compute_rpfilter_needed)"
+  local begin end
+  begin="$(secrets_marker_begin "$tun")"
+  end="$(secrets_marker_end "$tun")"
 
   {
-    echo "# Simple IPsec Tunnel sysctl (persist) - generated"
-    echo "net.ipv4.ip_forward=$( [[ "$forwarding_needed" == "yes" ]] && echo 1 || echo 0 )"
-    if [[ "$rp_needed" == "yes" ]]; then
-      echo "net.ipv4.conf.all.rp_filter=0"
-      echo "net.ipv4.conf.default.rp_filter=0"
-      local t
-      while IFS= read -r t; do
-        [[ -z "$t" ]] && continue
-        echo "net.ipv4.conf.${t}.rp_filter=0"
-      done < <(list_tunnels)
-    fi
-  } >"$SYSCTL_FILE"
+    echo "$begin"
+    echo "# Peer pair: ${LOCAL_WAN_IP} <-> ${REMOTE_WAN_IP}"
+    echo "${LOCAL_WAN_IP} ${REMOTE_WAN_IP} : PSK \"${PSK}\""
+    echo "$end"
+  } >> "$SECRETS_FILE"
 
-  chmod 644 "$SYSCTL_FILE"
-  sysctl --system >/dev/null 2>&1 || true
+  chmod 600 "$SECRETS_FILE"
 }
 
-# -------------------------
-# Ensure strongSwan include hooks
-# -------------------------
+# -----------------------
+# strongSwan include hooks
+# -----------------------
 ensure_strongswan_includes() {
-  ensure_dirs
-
   # ipsec.conf include
-  if [[ -f "$IPSEC_INCLUDE_CONF" ]]; then
-    if ! grep -qE '^\s*include\s+/etc/ipsec\.d/simple-ipsec/\*\.conf\s*$' "$IPSEC_INCLUDE_CONF"; then
-      warn "Adding include to $IPSEC_INCLUDE_CONF"
-      cp -a "$IPSEC_INCLUDE_CONF" "${IPSEC_INCLUDE_CONF}.bak.$(date +%s)" || true
-      printf "\n# added by simple-ipsec\ninclude /etc/ipsec.d/simple-ipsec/*.conf\n" >> "$IPSEC_INCLUDE_CONF"
-    fi
-  else
-    err "$IPSEC_INCLUDE_CONF not found. Is strongSwan installed correctly?"
+  if [[ ! -f "$IPSEC_CONF" ]]; then
+    err "$IPSEC_CONF not found. strongSwan installed?"
     return 1
+  fi
+  if ! grep -qE '^\s*include\s+/etc/ipsec\.d/simple-ipsec/\*\.conf\s*$' "$IPSEC_CONF"; then
+    warn "Adding include line to $IPSEC_CONF (backup will be created)"
+    cp -a "$IPSEC_CONF" "${IPSEC_CONF}.bak.$(date +%s)" || true
+    printf "\n# added by simple-ipsec\ninclude /etc/ipsec.d/simple-ipsec/*.conf\n" >> "$IPSEC_CONF"
   fi
 
   # ipsec.secrets include
-  if [[ -f "$IPSEC_INCLUDE_SECRETS" ]]; then
-    if ! grep -qE '^\s*include\s+/etc/ipsec\.d/simple-ipsec\.secrets\s*$' "$IPSEC_INCLUDE_SECRETS"; then
-      warn "Adding secrets include to $IPSEC_INCLUDE_SECRETS"
-      cp -a "$IPSEC_INCLUDE_SECRETS" "${IPSEC_INCLUDE_SECRETS}.bak.$(date +%s)" || true
-      printf "\n# added by simple-ipsec\ninclude /etc/ipsec.d/simple-ipsec.secrets\n" >> "$IPSEC_INCLUDE_SECRETS"
-    fi
-  else
-    err "$IPSEC_INCLUDE_SECRETS not found."
+  if [[ ! -f "$IPSEC_SECRETS" ]]; then
+    err "$IPSEC_SECRETS not found."
     return 1
   fi
+  if ! grep -qE '^\s*include\s+/etc/ipsec\.d/simple-ipsec\.secrets\s*$' "$IPSEC_SECRETS"; then
+    warn "Adding include line to $IPSEC_SECRETS (backup will be created)"
+    cp -a "$IPSEC_SECRETS" "${IPSEC_SECRETS}.bak.$(date +%s)" || true
+    printf "\n# added by simple-ipsec\ninclude /etc/ipsec.d/simple-ipsec.secrets\n" >> "$IPSEC_SECRETS"
+  fi
 
-  # ensure secrets file exists
-  touch /etc/ipsec.d/simple-ipsec.secrets
-  chmod 600 /etc/ipsec.d/simple-ipsec.secrets
+  touch "$SECRETS_FILE"
+  chmod 600 "$SECRETS_FILE"
 }
 
 write_ipsec_conn_conf() {
@@ -490,7 +391,7 @@ conn ${conn_name}
   left=${LOCAL_WAN_IP}
   right=${REMOTE_WAN_IP}
 
-  # Route-based VTI: use mark + disable policy install
+  # Route-based VTI
   mark=${MARK}
   installpolicy=no
 
@@ -504,27 +405,55 @@ EOF
   chmod 600 "$(ipsec_conn_conf_for "$tun")"
 }
 
-write_ipsec_secrets_line() {
-  # store per-tunnel line in /etc/ipsec.d/simple-ipsec.secrets (idempotent by peer pair)
-  local a="${LOCAL_WAN_IP}"
-  local b="${REMOTE_WAN_IP}"
-  local line="${a} ${b} : PSK \"${PSK}\""
-
-  # remove any previous line for same peer pair (either direction)
-  sed -i \
-    -e "\|^${a}[[:space:]]+${b}[[:space:]]+: PSK |d" \
-    -e "\|^${b}[[:space:]]+${a}[[:space:]]+: PSK |d" \
-    /etc/ipsec.d/simple-ipsec.secrets
-
-  echo "$line" >> /etc/ipsec.d/simple-ipsec.secrets
-  chmod 600 /etc/ipsec.d/simple-ipsec.secrets
+# -----------------------
+# Sysctl persist (global)
+# -----------------------
+compute_global_forwarding_needed() {
+  local t
+  while IFS= read -r t; do
+    read_conf "$t" || continue
+    [[ "${ENABLE_FORWARDING:-no}" == "yes" ]] && { echo "yes"; return; }
+  done < <(list_tunnels)
+  echo "no"
 }
 
-# -------------------------
-# systemd template + up/down
-# -------------------------
+compute_rpfilter_needed() {
+  local t
+  while IFS= read -r t; do
+    read_conf "$t" || continue
+    [[ "${DISABLE_RPFILTER:-no}" == "yes" ]] && { echo "yes"; return; }
+  done < <(list_tunnels)
+  echo "no"
+}
+
+write_sysctl_persist() {
+  local forwarding_needed rp_needed
+  forwarding_needed="$(compute_global_forwarding_needed)"
+  rp_needed="$(compute_rpfilter_needed)"
+
+  {
+    echo "# Simple IPsec Tunnel sysctl (persist) - generated"
+    echo "net.ipv4.ip_forward=$( [[ "$forwarding_needed" == "yes" ]] && echo 1 || echo 0 )"
+    if [[ "$rp_needed" == "yes" ]]; then
+      echo "net.ipv4.conf.all.rp_filter=0"
+      echo "net.ipv4.conf.default.rp_filter=0"
+      # also disable rp_filter per tunnel interface name
+      local t
+      while IFS= read -r t; do
+        [[ -n "$t" ]] && echo "net.ipv4.conf.${t}.rp_filter=0"
+      done < <(list_tunnels)
+    fi
+  } >"$SYSCTL_FILE"
+
+  chmod 644 "$SYSCTL_FILE"
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+# -----------------------
+# systemd template + helpers
+# -----------------------
 ensure_systemd_template() {
-  cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
+  cat >"$SERVICE_TEMPLATE" <<'EOF'
 [Unit]
 Description=Simple IPsec Tunnel - IPsec VTI (%i)
 After=network-online.target
@@ -540,15 +469,13 @@ ExecStop=/usr/local/sbin/simple-ipsec-down %i
 WantedBy=multi-user.target
 EOF
 
-  cat >/usr/local/sbin/simple-ipsec-up <<'EOF'
+  cat >"$UP_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
 SYSCTL_FILE="$APP_DIR/99-simple-ipsec.conf"
-
-IPSEC_INCLUDE_DIR="/etc/ipsec.d/simple-ipsec"
 
 tun="${1:-}"
 [[ -n "${tun}" ]] || { echo "Usage: simple-ipsec-up <tunnel_name>" >&2; exit 2; }
@@ -559,15 +486,10 @@ CONF_FILE="$TUNNELS_DIR/${tun}.conf"
 source "$CONF_FILE"
 
 conn_name="simple-ipsec-${tun}"
-conn_conf="${IPSEC_INCLUDE_DIR}/${tun}.conf"
 
 apply_sysctl() {
-  if [[ -f "$SYSCTL_FILE" ]]; then
-    sysctl --system >/dev/null 2>&1 || true
-  fi
-  if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-  fi
+  [[ -f "$SYSCTL_FILE" ]] && sysctl --system >/dev/null 2>&1 || true
+  [[ "${ENABLE_FORWARDING:-no}" == "yes" ]] && sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   if [[ "${DISABLE_RPFILTER:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
@@ -585,27 +507,23 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-reload_ipsec() {
-  # reread secrets + reload conns
+start_ipsec() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
-
-  # bring up this conn explicitly
   ipsec up "${conn_name}" >/dev/null 2>&1 || true
 }
 
 apply_sysctl
 ensure_vti
-reload_ipsec
+start_ipsec
 EOF
 
-  cat >/usr/local/sbin/simple-ipsec-down <<'EOF'
+  cat >"$DOWN_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
-IPSEC_INCLUDE_DIR="/etc/ipsec.d/simple-ipsec"
 
 tun="${1:-}"
 [[ -n "${tun}" ]] || { echo "Usage: simple-ipsec-down <tunnel_name>" >&2; exit 2; }
@@ -618,81 +536,98 @@ source "$CONF_FILE"
 conn_name="simple-ipsec-${tun}"
 
 ipsec down "${conn_name}" >/dev/null 2>&1 || true
-
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
-
-# leave ipsec config files intact; manager handles delete.
 EOF
 
-  chmod +x /usr/local/sbin/simple-ipsec-up /usr/local/sbin/simple-ipsec-down
+  chmod +x "$UP_HELPER" "$DOWN_HELPER"
   systemctl daemon-reload
 }
 
-enable_service_for_tunnel() {
-  local tun="$1"
-  systemctl enable "simple-ipsec@${tun}.service" >/dev/null 2>&1 || true
+enable_service() { systemctl enable "$(service_for "$1")" >/dev/null 2>&1 || true; }
+restart_service() { systemctl restart "$(service_for "$1")" >/dev/null 2>&1 || true; }
+stop_disable_service() {
+  systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
+  systemctl disable "$(service_for "$1")" >/dev/null 2>&1 || true
 }
 
-apply_now_tunnel() {
-  local tun="$1"
-  systemctl restart "simple-ipsec@${tun}.service" >/dev/null 2>&1 || true
+ipsec_reload_all() {
+  ipsec rereadsecrets >/dev/null 2>&1 || true
+  ipsec reload >/dev/null 2>&1 || true
 }
 
-stop_disable_tunnel_service() {
-  local tun="$1"
-  systemctl stop "simple-ipsec@${tun}.service" >/dev/null 2>&1 || true
-  systemctl disable "simple-ipsec@${tun}.service" >/dev/null 2>&1 || true
-}
-
-# -------------------------
-# Prompts
-# -------------------------
-prompt_role() {
+# -----------------------
+# Prompts (Create/Edit)
+# -----------------------
+prompt_role_create() {
   echo "Select server role:"
   echo "  1) Source (Iran)"
   echo "  2) Destination (Kharej)"
-  local choice
+  local c
   while true; do
-    read -r -p "Enter choice [1-2]: " choice || true
-    case "${choice:-}" in
+    read -r -p "Enter choice [1-2]: " c || true
+    case "${c:-}" in
       1) ROLE="source"; break ;;
       2) ROLE="destination"; break ;;
-      *) err "Invalid choice. Please enter 1 or 2." ;;
+      *) err "Invalid choice." ;;
     esac
   done
+}
+
+prompt_role_edit_keep() {
+  echo "Current role: ${ROLE}"
+  local c
+  read -r -p "Change role? (1=Source, 2=Destination, Enter=keep): " c || true
+  [[ -n "${c:-}" ]] || return 0
+  case "$c" in
+    1) ROLE="source" ;;
+    2) ROLE="destination" ;;
+    *) err "Invalid. Keeping role." ;;
+  esac
 }
 
 prompt_tun_name_new() {
   local inp chosen
   read -r -p "VTI interface name [${TUN_NAME_DEFAULT}]: " inp || true
   inp="${inp:-$TUN_NAME_DEFAULT}"
-
   is_ifname "$inp" || { err "Invalid interface name."; return 1; }
 
-  if ! name_taken "$inp"; then
-    TUN_NAME="$inp"
-    return 0
+  if ! name_taken_anywhere "$inp"; then
+    TUN_NAME="$inp"; return 0
   fi
 
-  if [[ "$inp" =~ ^vti[0-9]+$ ]] || [[ "$inp" == "vti" ]]; then
-    chosen="$(find_first_free_vti_name "vti")" || { err "Could not find a free vtiN name."; return 1; }
-    warn "Name '${inp}' is already taken. Auto-selected: ${chosen}"
-    TUN_NAME="$chosen"
-    return 0
+  if [[ "$inp" == "vti" || "$inp" =~ ^vti[0-9]+$ ]]; then
+    chosen="$(find_first_free_vti_name vti)" || { err "No free vtiN available."; return 1; }
+    warn "Name taken. Auto-selected: $chosen"
+    TUN_NAME="$chosen"; return 0
   fi
 
-  err "Name '${inp}' is already taken. Choose another."
+  err "Name '$inp' is already taken."
   return 1
+}
+
+prompt_tun_name_edit_keep_or_rename() {
+  local inp
+  read -r -p "VTI interface name [${TUN_NAME}] (Enter=keep): " inp || true
+  inp="${inp:-$TUN_NAME}"
+  is_ifname "$inp" || { err "Invalid interface name."; return 1; }
+
+  if [[ "$inp" != "$TUN_NAME" ]]; then
+    if name_taken_anywhere "$inp"; then
+      err "Name '$inp' is already taken."
+      return 1
+    fi
+  fi
+
+  TUN_NAME="$inp"
+  return 0
 }
 
 prompt_local_wan_ip() {
   local inp def_if def_ip
   def_if="$(default_iface || true)"
   def_ip=""
-  if [[ -n "${def_if:-}" ]]; then
-    def_ip="$(get_iface_ip "$def_if" || true)"
-  fi
+  [[ -n "${def_if:-}" ]] && def_ip="$(get_iface_ip "$def_if" || true)"
 
   if [[ -n "${LOCAL_WAN_IP:-}" ]]; then
     read -r -p "Local public IPv4 [${LOCAL_WAN_IP}]: " inp || true
@@ -706,7 +641,6 @@ prompt_local_wan_ip() {
 
   is_ipv4 "${inp:-}" || { err "Invalid IPv4."; return 1; }
   LOCAL_WAN_IP="$inp"
-  return 0
 }
 
 prompt_remote_wan_ip() {
@@ -715,67 +649,65 @@ prompt_remote_wan_ip() {
   inp="${inp:-${REMOTE_WAN_IP:-}}"
   is_ipv4 "${inp:-}" || { err "Invalid IPv4."; return 1; }
   REMOTE_WAN_IP="$inp"
-  return 0
 }
 
-prompt_pair_code() {
+prompt_pair_code_create() {
+  echo "PAIR CODE format: 10.X.Y"
   local inp
-  if [[ -z "${PAIR_CODE:-}" ]]; then
-    echo "PAIR CODE format: 10.X.Y"
-    read -r -p "PAIR CODE [auto]: " inp || true
-    if [[ -z "${inp:-}" ]]; then
-      PAIR_CODE="$(generate_pair_code)"
-      ok "Generated PAIR CODE: ${PAIR_CODE}"
-      return 0
-    fi
+  read -r -p "PAIR CODE [auto]: " inp || true
+  if [[ -z "${inp:-}" ]]; then
+    PAIR_CODE="$(generate_pair_code)"
+    ok "Generated PAIR CODE: $PAIR_CODE"
+  else
     parse_pair_code "$inp" >/dev/null || { err "Invalid PAIR CODE."; return 1; }
     PAIR_CODE="$inp"
-    return 0
   fi
+}
 
+prompt_pair_code_edit_keep() {
+  echo "PAIR CODE format: 10.X.Y"
+  local inp
   read -r -p "PAIR CODE [${PAIR_CODE}] (Enter=keep): " inp || true
   inp="${inp:-$PAIR_CODE}"
   parse_pair_code "$inp" >/dev/null || { err "Invalid PAIR CODE."; return 1; }
   PAIR_CODE="$inp"
-  return 0
 }
 
-prompt_mark() {
+prompt_mark_keep() {
   local inp
-  if [[ -z "${MARK:-}" ]]; then
-    MARK=$(( (RANDOM % (MARK_DEFAULT_MAX - MARK_DEFAULT_MIN + 1)) + MARK_DEFAULT_MIN ))
-    read -r -p "MARK (VTI key/mark) [${MARK}]: " inp || true
-    inp="${inp:-$MARK}"
-  else
-    read -r -p "MARK (VTI key/mark) [${MARK}]: " inp || true
-    inp="${inp:-$MARK}"
-  fi
-  [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1 && inp <= 2147483647 )) || { err "Invalid MARK."; return 1; }
+  [[ -n "${MARK:-}" ]] || MARK=$(( (RANDOM % (MARK_MAX - MARK_MIN + 1)) + MARK_MIN ))
+  read -r -p "MARK (VTI key/mark) [${MARK}] (Enter=keep): " inp || true
+  inp="${inp:-$MARK}"
+  [[ "$inp" =~ ^[0-9]+$ ]] && (( inp>=1 && inp<=2147483647 )) || { err "Invalid MARK."; return 1; }
   MARK="$inp"
 }
 
-prompt_mtu() {
+prompt_mtu_keep() {
   local inp
-  read -r -p "MTU [${MTU}]: " inp || true
+  [[ -n "${MTU:-}" ]] || MTU="$MTU_DEFAULT"
+  read -r -p "MTU [${MTU}] (Enter=keep): " inp || true
   inp="${inp:-$MTU}"
-  [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1200 && inp <= 9000 )) || { err "Invalid MTU."; return 1; }
+  [[ "$inp" =~ ^[0-9]+$ ]] && (( inp>=1200 && inp<=9000 )) || { err "Invalid MTU."; return 1; }
   MTU="$inp"
 }
 
-prompt_tuning() {
+prompt_tuning_keep() {
   local inp
-  read -r -p "Enable IPv4 forwarding? [${ENABLE_FORWARDING}] (yes/no): " inp || true
+  [[ -n "${ENABLE_FORWARDING:-}" ]] || ENABLE_FORWARDING="$ENABLE_FORWARDING_DEFAULT"
+  [[ -n "${DISABLE_RPFILTER:-}" ]] || DISABLE_RPFILTER="$DISABLE_RPFILTER_DEFAULT"
+
+  read -r -p "Enable IPv4 forwarding? [${ENABLE_FORWARDING}] (yes/no, Enter=keep): " inp || true
   inp="${inp:-$ENABLE_FORWARDING}"
   [[ "$inp" == "yes" || "$inp" == "no" ]] || { err "Invalid value."; return 1; }
   ENABLE_FORWARDING="$inp"
 
-  read -r -p "Disable rp_filter? [${DISABLE_RPFILTER}] (yes/no): " inp || true
+  read -r -p "Disable rp_filter? [${DISABLE_RPFILTER}] (yes/no, Enter=keep): " inp || true
   inp="${inp:-$DISABLE_RPFILTER}"
   [[ "$inp" == "yes" || "$inp" == "no" ]] || { err "Invalid value."; return 1; }
   DISABLE_RPFILTER="$inp"
 }
 
-prompt_psk() {
+prompt_psk_keep_or_set() {
   local inp
   if [[ -z "${PSK:-}" ]]; then
     read -r -p "PSK (shared secret) [auto-generate]: " inp || true
@@ -787,51 +719,79 @@ prompt_psk() {
     fi
   else
     read -r -p "PSK [hidden] (Enter=keep, type new to change): " inp || true
-    if [[ -n "${inp:-}" ]]; then
-      PSK="$inp"
-    fi
+    [[ -n "${inp:-}" ]] && PSK="$inp"
   fi
-
   ((${#PSK} >= 8)) || { err "PSK too short."; return 1; }
 }
 
-# -------------------------
-# Actions
-# -------------------------
-do_list() {
-  echo -e "${MAG}===== Tunnels =====${NC}"
-  local found="no"
-  local t
-  while IFS= read -r t; do
-    [[ -z "$t" ]] && continue
-    found="yes"
-    echo " - $t"
-  done < <(list_tunnels)
+# -----------------------
+# Core apply/remove operations
+# -----------------------
+apply_tunnel_files_and_service() {
+  local tun="$1"
 
-  if [[ "$found" == "no" ]]; then
-    warn "No tunnels configured yet."
-  fi
+  write_conf "$tun"
+  write_ipsec_conn_conf "$tun"
+  write_ipsec_secrets_block "$tun"
+  write_sysctl_persist
+
+  enable_service "$tun"
+  restart_service "$tun"
+
+  ipsec_reload_all
 }
 
-show_info_one() {
+remove_tunnel_everything() {
   local tun="$1"
-  if ! read_conf "$tun"; then
-    err "No configuration found for: $tun"
-    return
-  fi
+  # read to get interface name etc (usually equal to tun)
+  read_conf "$tun" || true
 
-  echo -e "${MAG}===== IPsec(VTI) Configuration: ${tun} =====${NC}"
-  echo "Role:                ${ROLE}"
-  echo "Pair code:           ${PAIR_CODE}"
-  echo "VTI name:            ${TUN_NAME}"
-  echo "Local public IP:     ${LOCAL_WAN_IP}"
-  echo "Remote public IP:    ${REMOTE_WAN_IP}"
-  echo "Local tunnel CIDR:   ${TUN_LOCAL_CIDR}"
-  echo "Remote tunnel IP:    ${TUN_REMOTE_IP}"
-  echo "MARK:                ${MARK}"
-  echo "MTU:                 ${MTU}"
-  echo "IPv4 forwarding:     ${ENABLE_FORWARDING}"
-  echo "rp_filter disabled:  ${DISABLE_RPFILTER}"
+  stop_disable_service "$tun"
+
+  # remove VTI interface (best-effort)
+  ip link set "$tun" down >/dev/null 2>&1 || true
+  ip link del "$tun" >/dev/null 2>&1 || true
+
+  # remove strongSwan conn + secrets block
+  rm -f "$(ipsec_conn_conf_for "$tun")" >/dev/null 2>&1 || true
+  remove_secrets_block "$tun"
+
+  # remove config
+  rm -f "$(conf_path_for "$tun")" >/dev/null 2>&1 || true
+
+  write_sysctl_persist
+  ipsec_reload_all
+}
+
+# -----------------------
+# Actions (menu)
+# -----------------------
+do_list() {
+  echo -e "${MAG}===== Tunnels =====${NC}"
+  local found="no" t
+  while IFS= read -r t; do
+    [[ -n "$t" ]] && { echo " - $t"; found="yes"; }
+  done < <(list_tunnels)
+  [[ "$found" == "yes" ]] || warn "No tunnels configured."
+}
+
+do_info() {
+  choose_tunnel || return
+  local tun="$SELECTED_TUN"
+  read_conf "$tun" || { err "Config not found."; return; }
+
+  echo -e "${MAG}===== IPsec(VTI) Info: ${tun} =====${NC}"
+  echo "Role:                $ROLE"
+  echo "Pair code:           $PAIR_CODE"
+  echo "Tunnel name:         $TUN_NAME"
+  echo "Local public IP:     $LOCAL_WAN_IP"
+  echo "Remote public IP:    $REMOTE_WAN_IP"
+  echo "Local tunnel CIDR:   $TUN_LOCAL_CIDR"
+  echo "Remote tunnel IP:    $TUN_REMOTE_IP"
+  echo "MARK:                $MARK"
+  echo "MTU:                 $MTU"
+  echo "IPv4 forwarding:     $ENABLE_FORWARDING"
+  echo "rp_filter disabled:  $DISABLE_RPFILTER"
   echo "Config file:         $(conf_path_for "$tun")"
   echo "IPsec conn file:     $(ipsec_conn_conf_for "$tun")"
   echo
@@ -839,171 +799,217 @@ show_info_one() {
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   warn "COPY BLOCK includes PSK. Keep it private."
   print_copy_block
-  echo -e "${YEL}Finish paste on the other server:${NC} Press Enter twice on empty lines."
-}
-
-do_create() {
-  log "Creating NEW IPsec(VTI) tunnel..."
-  echo
-
-  prompt_role
-  echo
-
-  # Defaults
-  TUN_NAME=""
-  MTU="$MTU_DEFAULT"
-  ENABLE_FORWARDING="$ENABLE_FORWARDING_DEFAULT"
-  DISABLE_RPFILTER="$DISABLE_RPFILTER_DEFAULT"
-  PAIR_CODE=""
-  LOCAL_WAN_IP=""
-  REMOTE_WAN_IP=""
-  MARK=""
-  PSK=""
-  PASTE_SOURCE_PUBLIC_IP=""
-  PASTE_DEST_PUBLIC_IP=""
-
-  if ! prompt_paste_copy_block; then
-    err "Failed to parse COPY BLOCK."
-    return
-  fi
-  echo
-
-  prompt_tun_name_new || return
-
-  if [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" && -n "${PASTE_DEST_PUBLIC_IP:-}" ]]; then
-    if [[ "${ROLE}" == "source" ]]; then
-      LOCAL_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
-      REMOTE_WAN_IP="${PASTE_DEST_PUBLIC_IP}"
-    else
-      LOCAL_WAN_IP="${PASTE_DEST_PUBLIC_IP}"
-      REMOTE_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
-    fi
-    ok "Public IPs filled from COPY BLOCK."
-  fi
-
-  prompt_local_wan_ip || return
-  prompt_remote_wan_ip || return
-  prompt_pair_code || return
-  recompute_tunnel_ips_from_pair || return
-
-  prompt_mark || return
-  prompt_mtu || return
-  prompt_tuning || return
-  prompt_psk || return
-
-  ensure_systemd_template
-  ensure_strongswan_includes
-
-  write_conf "$TUN_NAME"
-  write_sysctl_persist
-
-  # write strongSwan conn + secrets
-  write_ipsec_conn_conf "$TUN_NAME"
-  write_ipsec_secrets_line
-
-  enable_service_for_tunnel "$TUN_NAME"
-  apply_now_tunnel "$TUN_NAME"
-
-  ok "Tunnel '${TUN_NAME}' created and persisted (systemd)."
-  echo
-  echo -e "${GRN}Tunnel addressing:${NC}"
-  echo "  PAIR CODE:          ${PAIR_CODE}"
-  echo "  Local tunnel CIDR:  ${TUN_LOCAL_CIDR}"
-  echo "  Remote tunnel IP:   ${TUN_REMOTE_IP}"
-  echo
-  echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
-  warn "COPY BLOCK includes PSK. Keep it private."
-  print_copy_block
-  echo -e "${YEL}Finish paste on the other server:${NC} Press Enter twice on empty lines."
 }
 
 do_status_one() {
-  if ! choose_tunnel; then return; fi
+  choose_tunnel || return
   local tun="$SELECTED_TUN"
-  if ! read_conf "$tun"; then err "No config for: $tun"; return; fi
+  read_conf "$tun" || { err "Config not found."; return; }
 
-  local conn
-  conn="$(conn_name_for "$tun")"
-
-  echo -e "${MAG}===== IPsec(VTI) Status: ${tun} =====${NC}"
+  echo -e "${MAG}===== Status: ${tun} =====${NC}"
   echo -e "${WHT}Service:${NC}"
   systemctl --no-pager --full status "$(service_for "$tun")" || true
   echo
 
   echo -e "${WHT}Interface:${NC}"
-  ip -d link show "$TUN_NAME" 2>/dev/null || { err "Interface not found. Try restarting service."; return; }
-  ip -d link show "$TUN_NAME" || true
-  echo
-
-  echo -e "${WHT}IP addresses:${NC}"
-  ip -4 addr show dev "$TUN_NAME" || true
+  ip -d link show "$tun" 2>/dev/null || { warn "Interface '$tun' not found (service may be down)."; }
+  ip -4 addr show dev "$tun" 2>/dev/null || true
   echo
 
   echo -e "${WHT}Counters:${NC}"
-  ip -s link show "$TUN_NAME" || true
+  ip -s link show "$tun" 2>/dev/null || true
   echo
 
-  echo -e "${WHT}IPsec status:${NC}"
+  echo -e "${WHT}IPsec status (top):${NC}"
   ipsec statusall | sed -n '1,80p' || true
   echo
 
-  echo -e "${WHT}Connectivity test:${NC} ping remote tunnel IP (${TUN_REMOTE_IP})"
+  echo -e "${WHT}Ping remote tunnel IP:${NC} ${TUN_REMOTE_IP}"
   if ping -c 3 -W 2 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
-    ok "Ping successful. VTI looks reachable."
+    ok "Ping OK."
   else
-    warn "Ping failed."
-    warn "If IPsec is UP but ping fails: check MTU, rp_filter=0, and that both sides have matching PAIR_CODE/MARK/PSK."
+    warn "Ping failed. Check: MTU, both sides same PAIR_CODE/MARK/PSK, rp_filter=0, and IPsec is UP."
   fi
 }
 
-do_info() {
-  if ! choose_tunnel; then return; fi
-  show_info_one "$SELECTED_TUN"
+do_status_all() {
+  echo -e "${MAG}===== Status: ALL Tunnels =====${NC}"
+  local t any="no"
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    any="yes"
+    echo -e "${CYA}--- ${t} ---${NC}"
+    if read_conf "$t"; then
+      systemctl is-active --quiet "$(service_for "$t")" && echo "Service: active" || echo "Service: inactive"
+      ip link show "$t" >/dev/null 2>&1 && echo "Interface: present" || echo "Interface: missing"
+      echo "Tunnel IP: ${TUN_LOCAL_CIDR} -> ${TUN_REMOTE_IP}"
+    else
+      echo "Config: missing"
+    fi
+    echo
+  done < <(list_tunnels)
+
+  [[ "$any" == "yes" ]] || warn "No tunnels configured."
+}
+
+do_create() {
+  log "Create NEW IPsec(VTI) tunnel"
+  echo
+
+  # defaults
+  ROLE=""
+  TUN_NAME=""
+  LOCAL_WAN_IP=""
+  REMOTE_WAN_IP=""
+  PAIR_CODE=""
+  MARK=""
+  MTU="$MTU_DEFAULT"
+  ENABLE_FORWARDING="$ENABLE_FORWARDING_DEFAULT"
+  DISABLE_RPFILTER="$DISABLE_RPFILTER_DEFAULT"
+  PSK=""
+  PASTE_SOURCE_PUBLIC_IP=""
+  PASTE_DEST_PUBLIC_IP=""
+
+  prompt_role_create
+  echo
+
+  # optional paste block
+  prompt_paste_copy_block || { err "COPY BLOCK parse failed."; return; }
+  echo
+
+  # name
+  prompt_tun_name_new || return
+
+  # if COPY BLOCK provided public IPs, map them based on role
+  if [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" && -n "${PASTE_DEST_PUBLIC_IP:-}" ]]; then
+    if [[ "$ROLE" == "source" ]]; then
+      LOCAL_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
+      REMOTE_WAN_IP="$PASTE_DEST_PUBLIC_IP"
+    else
+      LOCAL_WAN_IP="$PASTE_DEST_PUBLIC_IP"
+      REMOTE_WAN_IP="$PASTE_SOURCE_PUBLIC_IP"
+    fi
+    ok "Public IPs imported from COPY BLOCK."
+  fi
+
+  prompt_local_wan_ip || return
+  prompt_remote_wan_ip || return
+
+  # pair code
+  if [[ -z "${PAIR_CODE:-}" ]]; then
+    prompt_pair_code_create || return
+  else
+    # already pasted
+    parse_pair_code "$PAIR_CODE" >/dev/null || { err "Invalid PAIR_CODE from COPY BLOCK."; return; }
+  fi
+  recompute_tunnel_ips_from_pair || return
+
+  # mark / mtu / sysctl / psk
+  prompt_mark_keep || return
+  prompt_mtu_keep || return
+  prompt_tuning_keep || return
+  prompt_psk_keep_or_set || return
+
+  ensure_strongswan_includes
+  ensure_systemd_template
+
+  # FINAL apply
+  apply_tunnel_files_and_service "$TUN_NAME"
+
+  ok "Tunnel '${TUN_NAME}' created & applied."
+  echo
+  echo -e "${GRN}Tunnel addressing:${NC}"
+  echo "  PAIR_CODE:         ${PAIR_CODE}"
+  echo "  Local CIDR:        ${TUN_LOCAL_CIDR}"
+  echo "  Remote tunnel IP:  ${TUN_REMOTE_IP}"
+  echo
+  echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
+  warn "COPY BLOCK includes PSK. Keep it private."
+  print_copy_block
+}
+
+do_edit() {
+  choose_tunnel || return
+  local old_tun="$SELECTED_TUN"
+
+  read_conf "$old_tun" || { err "Config not found for: $old_tun"; return; }
+
+  log "Edit tunnel: $old_tun"
+  warn "Press Enter to keep existing values."
+  echo
+
+  # Keep a snapshot
+  local old_role="$ROLE"
+  local old_pair="$PAIR_CODE"
+  local old_local_wan="$LOCAL_WAN_IP"
+  local old_remote_wan="$REMOTE_WAN_IP"
+  local old_mark="$MARK"
+  local old_mtu="$MTU"
+  local old_fwd="$ENABLE_FORWARDING"
+  local old_rpf="$DISABLE_RPFILTER"
+  local old_psk="$PSK"
+  local old_name="$TUN_NAME" # normally equals old_tun
+
+  prompt_role_edit_keep
+  prompt_pair_code_edit_keep || { ROLE="$old_role"; return; }
+  recompute_tunnel_ips_from_pair || { ROLE="$old_role"; PAIR_CODE="$old_pair"; return; }
+
+  prompt_tun_name_edit_keep_or_rename || { ROLE="$old_role"; PAIR_CODE="$old_pair"; return; }
+  prompt_local_wan_ip || { ROLE="$old_role"; return; }
+  prompt_remote_wan_ip || { ROLE="$old_role"; return; }
+
+  prompt_mark_keep || { MARK="$old_mark"; return; }
+  prompt_mtu_keep || { MTU="$old_mtu"; return; }
+  prompt_tuning_keep || { ENABLE_FORWARDING="$old_fwd"; DISABLE_RPFILTER="$old_rpf"; return; }
+  prompt_psk_keep_or_set || { PSK="$old_psk"; return; }
+
+  ensure_strongswan_includes
+  ensure_systemd_template
+
+  # If renamed, we must remove old artifacts safely first
+  if [[ "$TUN_NAME" != "$old_tun" ]]; then
+    warn "Renaming tunnel: ${old_tun} -> ${TUN_NAME}"
+    # stop old service + remove old interface + old conn + old secrets + old conf
+    stop_disable_service "$old_tun"
+    ip link set "$old_tun" down >/dev/null 2>&1 || true
+    ip link del "$old_tun" >/dev/null 2>&1 || true
+    rm -f "$(ipsec_conn_conf_for "$old_tun")" >/dev/null 2>&1 || true
+    remove_secrets_block "$old_tun"
+    rm -f "$(conf_path_for "$old_tun")" >/dev/null 2>&1 || true
+  else
+    # same name: just restart later
+    stop_disable_service "$old_tun" >/dev/null 2>&1 || true
+  fi
+
+  # apply new artifacts under new name
+  apply_tunnel_files_and_service "$TUN_NAME"
+
+  ok "Tunnel updated & applied: ${TUN_NAME}"
+  echo
+  echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
+  warn "COPY BLOCK includes PSK. Keep it private."
+  print_copy_block
 }
 
 do_delete() {
-  if ! choose_tunnel; then return; fi
+  choose_tunnel || return
   local tun="$SELECTED_TUN"
-  if ! read_conf "$tun"; then err "No config for: $tun"; return; fi
 
-  warn "This will remove tunnel '$tun', its systemd service, and IPsec conn file. Secrets line will be removed for this peer pair."
+  warn "Delete tunnel '$tun' (service + interface + ipsec conn + secrets block + config)."
   local yn
   read -r -p "Are you sure? [y/N]: " yn || true
-  yn="${yn:-N}"
-  if [[ ! "$yn" =~ ^([yY])$ ]]; then
-    log "Canceled."
-    return
-  fi
+  [[ "${yn:-N}" =~ ^([yY])$ ]] || { log "Canceled."; return; }
 
-  stop_disable_tunnel_service "$tun"
-
-  # remove interface
-  ip link set "$TUN_NAME" down >/dev/null 2>&1 || true
-  ip link del "$TUN_NAME" >/dev/null 2>&1 || true
-
-  # remove ipsec conn conf
-  rm -f "$(ipsec_conn_conf_for "$tun")" || true
-
-  # remove secrets line (both directions)
-  if [[ -f /etc/ipsec.d/simple-ipsec.secrets ]]; then
-    sed -i \
-      -e "\|^${LOCAL_WAN_IP}[[:space:]]+${REMOTE_WAN_IP}[[:space:]]+: PSK |d" \
-      -e "\|^${REMOTE_WAN_IP}[[:space:]]+${LOCAL_WAN_IP}[[:space:]]+: PSK |d" \
-      /etc/ipsec.d/simple-ipsec.secrets || true
-  fi
-
-  rm -f "$(conf_path_for "$tun")" || true
-
-  write_sysctl_persist
-  ipsec reload >/dev/null 2>&1 || true
-  ipsec rereadsecrets >/dev/null 2>&1 || true
-
-  ok "Deleted tunnel '$tun'."
+  remove_tunnel_everything "$tun"
+  ok "Deleted tunnel: $tun"
 }
 
+# -----------------------
+# Banner / menu
+# -----------------------
 banner() {
   echo -e "${MAG}========================================${NC}"
-  echo -e "${WHT}  ${APP_NAME}${NC}  ${CYA}(IPsec VTI Manager - Multi)${NC}"
+  echo -e "${WHT}  ${APP_NAME}${NC}  ${CYA}(IKEv2 + VTI | Multi Tunnel)${NC}"
   echo -e "${YEL}  Repo:${NC} ${BLU}${REPO_URL}${NC}"
   echo -e "${MAG}========================================${NC}"
 }
@@ -1013,20 +1019,24 @@ menu() {
     clear || true
     banner
     echo -e "${CYA}1)${NC} Create tunnel (new)"
-    echo -e "${CYA}2)${NC} Status (one tunnel)"
-    echo -e "${CYA}3)${NC} Info / COPY BLOCK (one tunnel)"
-    echo -e "${CYA}4)${NC} List tunnels"
-    echo -e "${CYA}5)${NC} Delete tunnel"
+    echo -e "${CYA}2)${NC} Edit tunnel (rename supported)"
+    echo -e "${CYA}3)${NC} Status (one tunnel)"
+    echo -e "${CYA}4)${NC} Status (ALL tunnels)"
+    echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
+    echo -e "${CYA}6)${NC} List tunnels"
+    echo -e "${CYA}7)${NC} Delete tunnel"
     echo -e "${CYA}0)${NC} Exit"
     echo -e "${MAG}----------------------------------------${NC}"
     local choice
-    read -r -p "Select an option [0-5]: " choice || true
+    read -r -p "Select an option [0-7]: " choice || true
     case "${choice:-}" in
       1) do_create; pause ;;
-      2) do_status_one; pause ;;
-      3) do_info; pause ;;
-      4) do_list; pause ;;
-      5) do_delete; pause ;;
+      2) do_edit; pause ;;
+      3) do_status_one; pause ;;
+      4) do_status_all; pause ;;
+      5) do_info; pause ;;
+      6) do_list; pause ;;
+      7) do_delete; pause ;;
       0) exit 0 ;;
       *) err "Invalid selection."; pause ;;
     esac
@@ -1037,8 +1047,9 @@ main() {
   require_root
   require_cmds
   ensure_dirs
-  ensure_systemd_template
   ensure_strongswan_includes
+  ensure_systemd_template
+  write_sysctl_persist
   menu
 }
 
