@@ -50,6 +50,7 @@ ensure_deps() {
   have_cmd ip      || missing_pkgs+=("iproute2")
   have_cmd ping    || missing_pkgs+=("iputils-ping")
   have_cmd timeout || missing_pkgs+=("coreutils")
+  have_cmd iptables || missing_pkgs+=("iptables")
 
   # ipsec is the key: often provided by strongswan-starter
   if ! have_cmd ipsec; then
