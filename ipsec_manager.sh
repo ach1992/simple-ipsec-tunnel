@@ -400,9 +400,15 @@ conn ${conn_name}
   left=${LOCAL_WAN_IP}
   right=${REMOTE_WAN_IP}
 
-  # Route-based VTI
+  # Route-based VTI (IMPORTANT)
   mark=${MARK}
   installpolicy=no
+  vti-interface=${tun}
+  vti-routing=no
+
+  # IMPORTANT: ensure CHILD_SA carries traffic (not just /32<->/32)
+  leftsubnet=0.0.0.0/0
+  rightsubnet=0.0.0.0/0
 
   ike=aes256-sha256-modp2048!
   esp=aes256-sha256!
@@ -411,6 +417,7 @@ conn ${conn_name}
   dpddelay=30s
   keyingtries=%forever
 EOF
+
   chmod 600 "$(ipsec_conn_conf_for "$tun")"
 }
 
