@@ -7,10 +7,11 @@ set -Eeuo pipefail
 #
 # Installs:
 #  - /usr/local/bin/simple-ipsec  (from ipsec_manager.sh)
-# Ensures deps:
-#  - strongswan + strongswan-starter (ipsec command)
-#  - iproute2, iputils-ping, coreutils (timeout)
-#  - curl
+#
+# Behavior:
+#  - If dependencies already exist, does NOT apt-get update/install again.
+#  - Installs ONLY missing deps.
+#  - Runs apt-get update ONLY if needed (install fails without it).
 # ==========================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -37,36 +38,56 @@ need_root() {
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_deps() {
+  # What we actually need:
+  # - curl (download)
+  # - ip (iproute2)
+  # - ping (iputils-ping)
+  # - timeout (coreutils)
+  # - ipsec (strongswan/strongswan-starter provides it)
+  local missing_pkgs=()
+
+  have_cmd curl    || missing_pkgs+=("curl")
+  have_cmd ip      || missing_pkgs+=("iproute2")
+  have_cmd ping    || missing_pkgs+=("iputils-ping")
+  have_cmd timeout || missing_pkgs+=("coreutils")
+
+  # ipsec is the key: often provided by strongswan-starter
+  if ! have_cmd ipsec; then
+    missing_pkgs+=("strongswan" "strongswan-starter")
+  fi
+
+  if ((${#missing_pkgs[@]} == 0)); then
+    ok "All dependencies already installed. (No apt-get update/install)"
+    return 0
+  fi
+
   if ! have_cmd apt-get; then
     err "apt-get not found. This installer supports Debian/Ubuntu."
+    err "Missing packages: ${missing_pkgs[*]}"
     exit 1
   fi
 
+  warn "Missing packages: ${missing_pkgs[*]}"
   export DEBIAN_FRONTEND=noninteractive
 
-  log "Installing dependencies..."
-  apt-get update -y
+  log "Installing missing packages (no apt-get update)..."
+  if apt-get install -y "${missing_pkgs[@]}"; then
+    ok "Installed missing packages."
+  else
+    warn "Install failed without update. Running apt-get update and retrying..."
+    apt-get update -y
+    apt-get install -y "${missing_pkgs[@]}"
+    ok "Installed missing packages after apt-get update."
+  fi
 
-  # IMPORTANT: ipsec command often comes from strongswan-starter
-  apt-get install -y \
-    curl \
-    strongswan \
-    strongswan-starter \
-    iproute2 \
-    iputils-ping \
-    coreutils
-
-  # Validate ipsec exists (PATH-safe)
+  # final validation
   if ! have_cmd ipsec; then
     err "'ipsec' command still not found after install."
     err "Check if it exists but PATH is wrong:"
     err "  ls -l /usr/sbin/ipsec /sbin/ipsec"
-    err "Your PATH:"
-    err "  $PATH"
+    err "PATH: $PATH"
     exit 1
   fi
-
-  ok "Dependencies installed and ipsec command found."
 }
 
 download_script() {
