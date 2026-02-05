@@ -462,6 +462,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+
+# Anti-hang: never wait forever
+TimeoutStartSec=15
+TimeoutStopSec=10
+
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
 
@@ -510,8 +515,11 @@ ensure_vti() {
 start_ipsec() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
-  ipsec up "${conn_name}" >/dev/null 2>&1 || true
+
+  # Anti-hang: don't block forever if peer isn't ready
+  timeout 12 ipsec up "${conn_name}" >/dev/null 2>&1 || true
 }
+
 
 apply_sysctl
 ensure_vti
@@ -736,7 +744,7 @@ apply_tunnel_files_and_service() {
   write_sysctl_persist
 
   enable_service "$tun"
-  restart_service "$tun"
+  timeout 15 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
 
   ipsec_reload_all
 }
