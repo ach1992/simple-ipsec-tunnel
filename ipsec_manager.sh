@@ -1019,7 +1019,7 @@ menu() {
     clear || true
     banner
     echo -e "${CYA}1)${NC} Create tunnel (new)"
-    echo -e "${CYA}2)${NC} Edit tunnel (rename supported)"
+    echo -e "${CYA}2)${NC} Edit tunnel"
     echo -e "${CYA}3)${NC} Status (one tunnel)"
     echo -e "${CYA}4)${NC} Status (ALL tunnels)"
     echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
