@@ -270,6 +270,9 @@ prompt_paste_copy_block() {
   echo
 
   local first=""
+  echo -e "${YEL}Paste the COPY BLOCK now.${NC}"
+  echo -e "When you're done, press ${WHT}Enter twice${NC} on empty lines to finish."
+  echo
   read -r -p "Paste first line (or just Enter to skip): " first || true
   [[ -n "${first:-}" ]] || return 0
 
@@ -279,7 +282,12 @@ prompt_paste_copy_block() {
     read -r line || true
     if [[ -z "${line:-}" ]]; then
       empty_count=$((empty_count+1))
-      (( empty_count>=2 )) && break
+      if (( empty_count >= 2 )); then
+        echo
+        ok "Paste finished (Enter twice detected). Parsing COPY BLOCK..."
+        echo
+        break
+      fi
       continue
     fi
     empty_count=0
