@@ -400,13 +400,12 @@ conn ${conn_name}
   left=${LOCAL_WAN_IP}
   right=${REMOTE_WAN_IP}
 
-  # Route-based VTI (IMPORTANT)
+  # Route-based VTI
   mark=${MARK}
-  installpolicy=no
   vti-interface=${tun}
   vti-routing=no
 
-  # IMPORTANT: ensure CHILD_SA carries traffic (not just /32<->/32)
+  # Carry traffic (not just /32 <-> /32)
   leftsubnet=0.0.0.0/0
   rightsubnet=0.0.0.0/0
 
