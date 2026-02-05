@@ -7,9 +7,13 @@ set -Eeuo pipefail
 #
 # Installs:
 #  - /usr/local/bin/simple-ipsec  (from ipsec_manager.sh)
-# Dependencies:
-#  - strongswan, iproute2, iputils-ping, curl
+# Ensures deps:
+#  - strongswan + strongswan-starter (ipsec command)
+#  - iproute2, iputils-ping, coreutils (timeout)
+#  - curl
 # ==========================================
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/ach1992/simple-ipsec-tunnel/main"
 SCRIPT_NAME_IN_REPO="ipsec_manager.sh"
@@ -32,46 +36,37 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-install_missing_deps_if_possible() {
-  local missing=()
-  have_cmd curl  || missing+=("curl")
-  have_cmd ip    || missing+=("iproute2")
-  have_cmd ping  || missing+=("iputils-ping")
-  have_cmd ipsec || missing+=("strongswan")
-
-  if ((${#missing[@]} == 0)); then
-    ok "All required dependencies are installed."
-    return 0
-  fi
-
+ensure_deps() {
   if ! have_cmd apt-get; then
     err "apt-get not found. This installer supports Debian/Ubuntu."
-    err "Missing dependencies: ${missing[*]}"
-    err "Please install them manually and rerun installer."
-    return 1
+    exit 1
   fi
-
-  warn "Missing dependencies: ${missing[*]}"
-  warn "Attempting install..."
 
   export DEBIAN_FRONTEND=noninteractive
 
-  # try without update first
-  if apt-get install -y "${missing[@]}"; then
-    ok "Installed missing dependencies (no apt-get update)."
-    return 0
+  log "Installing dependencies..."
+  apt-get update -y
+
+  # IMPORTANT: ipsec command often comes from strongswan-starter
+  apt-get install -y \
+    curl \
+    strongswan \
+    strongswan-starter \
+    iproute2 \
+    iputils-ping \
+    coreutils
+
+  # Validate ipsec exists (PATH-safe)
+  if ! have_cmd ipsec; then
+    err "'ipsec' command still not found after install."
+    err "Check if it exists but PATH is wrong:"
+    err "  ls -l /usr/sbin/ipsec /sbin/ipsec"
+    err "Your PATH:"
+    err "  $PATH"
+    exit 1
   fi
 
-  warn "Retrying with apt-get update..."
-  if apt-get update -y && apt-get install -y "${missing[@]}"; then
-    ok "Installed missing dependencies after apt-get update."
-    return 0
-  fi
-
-  err "Could not install dependencies automatically."
-  err "Manual:"
-  err "  apt-get update && apt-get install -y ${missing[*]}"
-  return 1
+  ok "Dependencies installed and ipsec command found."
 }
 
 download_script() {
@@ -91,7 +86,7 @@ cleanup() { rm -rf "$TMP_DIR" >/dev/null 2>&1 || true; }
 
 main() {
   need_root
-  install_missing_deps_if_possible
+  ensure_deps
   download_script
   install_script
   cleanup
