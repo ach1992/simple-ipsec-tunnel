@@ -41,9 +41,9 @@ ENABLE_SRC_VALID_MARK_DEFAULT="yes"
 ENABLE_DISABLE_POLICY_DEFAULT="no"   # risky globally; per-iface only
 
 # Timeouts (slow/unstable networks may need more time)
-SYSTEMCTL_RESTART_TIMEOUT=180   # seconds
-IPSEC_UP_TIMEOUT=60             # seconds
-XFRM_WAIT_MAX=90                # seconds
+SYSTEMCTL_RESTART_TIMEOUT="${SYSTEMCTL_RESTART_TIMEOUT:-180}"   # seconds
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"                     # seconds
+XFRM_WAIT_MAX="${XFRM_WAIT_MAX:-90}"                           # seconds
 
 # Colors
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
@@ -293,7 +293,7 @@ prompt_paste_copy_block() {
   local first=""
   read -r -p "Paste the COPY BLOCK (or just Enter to skip): " first || true
   [[ -n "${first:-}" ]] || return 0
-  
+
   local lines=("$first") empty_count=0 line
   while true; do
     line=""
@@ -541,6 +541,9 @@ EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"
+XFRM_WAIT_MAX="${XFRM_WAIT_MAX:-90}"
+
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
 SYSCTL_FILE="$APP_DIR/99-simple-ipsec.conf"
@@ -705,6 +708,9 @@ xfrm_policy_install_tunnel_ips() {
   [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
 
   reqid="$(xfrm_reqid_from_state || true)"
+  # sanitize to digits only (iproute2 rejects formats like 1(0x...))
+  reqid="${reqid%%(*}"
+  reqid="${reqid//[^0-9]/}"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
   # delete best-effort (idempotent)
@@ -737,7 +743,7 @@ ensure_policy_routing
 start_ipsec
 
 # Wait briefly for XFRM state to appear (prevents "SA up but ping dead" race)
-for i in $(seq 1 "$XFRM_WAIT_MAX"); do
+for i in $(seq 1 "${XFRM_WAIT_MAX}"); do
   if ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
     break
   fi
@@ -749,7 +755,6 @@ for i in $(seq 1 "$XFRM_WAIT_MAX"); do
 
   sleep 1
 done
-
 
 # Critical fix: ensure ping over tunnel works deterministically (retry a few times)
 for i in $(seq 1 3); do
@@ -783,6 +788,32 @@ mark_to_dec() {
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
+
+xfrm_state_mark_dec() {
+  # Try both directions; return decimal mark or empty
+  local m=""
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="mark" {print $2; exit}
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${m:-}" ]]; then
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="mark" {print $2; exit}
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${m:-}" ]] || return 0
+  m="${m%%/*}"   # strip /0xffffffff
+  if [[ "$m" =~ ^0x ]]; then
+    echo $((16#${m#0x}))
+  else
+    echo "$m"
+  fi
+}
 
 cleanup_iptables_mangle_rules() {
   # remove both rules if exist (idempotent)
@@ -974,6 +1005,7 @@ enable_service() {
   local svc; svc="$(service_for "$1")"
   systemctl enable --now "$svc" >/dev/null 2>&1 || true
 }
+
 stop_disable_service() {
   # stopping the service triggers ExecStop (down helper) which does cleanup
   systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
@@ -1249,10 +1281,11 @@ remove_tunnel_everything() {
   stop_disable_service "$tun"
 
   # Extra safety cleanup even if systemd/ExecStop was not effective
-  iptables -t mangle -D OUTPUT -o "${tun}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
-  iptables -t mangle -D PREROUTING -i "${tun}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
-  ip link set "$tun" down >/dev/null 2>&1 || true
-  ip link del "$tun" >/dev/null 2>&1 || true
+  local ifc="${TUN_NAME:-$tun}"
+  iptables -t mangle -D OUTPUT -o "${ifc}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i "${ifc}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
+  ip link set "${ifc}" down >/dev/null 2>&1 || true
+  ip link del "${ifc}" >/dev/null 2>&1 || true
 
   rm -f "$(ipsec_conn_conf_for "$tun")" >/dev/null 2>&1 || true
   remove_secrets_block "$tun"
@@ -1322,15 +1355,18 @@ do_status_one() {
   else
     echo -e "Interface: ${RED}missing${NC}"
   fi
+
   MARK_DEC="$(mark_to_dec "$MARK")"
   mark_hex=$(printf "0x%08x" "$MARK_DEC")
+
   if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-  echo -e "XFRM state: ${GRN}present${NC}"
-elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
-  echo -e "XFRM state: ${GRN}present${NC}"
-else
-  echo -e "XFRM state: ${RED}missing${NC}"
-fi
+    echo -e "XFRM state: ${GRN}present${NC}"
+  elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+    echo -e "XFRM state: ${GRN}present${NC}"
+  else
+    echo -e "XFRM state: ${RED}missing${NC}"
+  fi
+
   if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
     echo -e "Ping: ${GRN}OK${NC} (${TUN_REMOTE_IP})"
   else
@@ -1390,12 +1426,12 @@ do_status_all() {
       MARK_DEC="$(mark_to_dec "$MARK")"
       mark_hex=$(printf "0x%08x" "$MARK_DEC")
       if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-  echo -e "XFRM state: ${GRN}present${NC}"
-elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
-  echo -e "XFRM state: ${GRN}present${NC}"
-else
-  echo -e "XFRM state: ${RED}missing${NC}"
-fi
+        echo -e "XFRM state: ${GRN}present${NC}"
+      elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+        echo -e "XFRM state: ${GRN}present${NC}"
+      else
+        echo -e "XFRM state: ${RED}missing${NC}"
+      fi
 
       # Tunnel health
       if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
@@ -1533,7 +1569,6 @@ do_edit() {
   print_copy_block
 }
 
-
 do_force_fix_one() {
   choose_tunnel || return 0
   local tun="$SELECTED_TUN"
@@ -1544,7 +1579,7 @@ do_force_fix_one() {
     /usr/local/sbin/simple-ipsec-fix "$tun" || true
   else
     warn "Fix helper not found; restarting service as fallback."
-    timeout 25 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
+    timeout "${SYSTEMCTL_RESTART_TIMEOUT}" systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
   fi
 }
 
@@ -1559,7 +1594,7 @@ do_force_fix_all() {
       /usr/local/sbin/simple-ipsec-fix "$t" || true
       echo
     else
-      timeout 25 systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
+      timeout "${SYSTEMCTL_RESTART_TIMEOUT}" systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
     fi
   done < <(list_tunnels)
   [[ "$any" == "yes" ]] || warn "No tunnels configured."
