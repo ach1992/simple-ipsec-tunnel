@@ -706,6 +706,10 @@ xfrm_policy_install_tunnel_ips() {
   [[ -n "${reqid:-}" ]] || reqid="1"
 
   # delete best-effort (idempotent)
+  # best-effort delete old policies (with and without mark) to avoid "File exists"
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
@@ -713,15 +717,15 @@ xfrm_policy_install_tunnel_ips() {
   # add policies (tunnel IPs) using effective mark
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in  \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}"  proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}"  proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 apply_sysctl
@@ -789,6 +793,10 @@ cleanup_xfrm_policies() {
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
 
+  # best-effort delete old policies (with and without mark) to avoid "File exists"
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
@@ -907,21 +915,25 @@ xfrm_policy_install_tunnel_ips() {
   reqid="$(xfrm_reqid_from_state || true)"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
+  # best-effort delete old policies (with and without mark) to avoid "File exists"
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in  \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}"  proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}"  proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
     mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 echo "[INFO] Ensuring IPsec is up (best-effort)..."
@@ -952,7 +964,7 @@ EOF
   systemctl daemon-reload
 }
 
-enable_service() { systemctl enable "$(service_for "$1")" >/dev/null 2>&1 || true; }
+enable_service() { systemctl enable --now "$(service_for "$1")" >/dev/null 2>&1 || true; }
 stop_disable_service() {
   # stopping the service triggers ExecStop (down helper) which does cleanup
   systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
@@ -1315,6 +1327,24 @@ do_status_all() {
     if read_conf "$t"; then
       systemctl is-active --quiet "$(service_for "$t")" && echo "Service: active" || echo "Service: inactive"
       ip link show "$t" >/dev/null 2>&1 && echo "Interface: present" || echo "Interface: missing"
+      # Tunnel health: consider ACTIVE if SA exists for this mark and ping works
+      local mark_hex
+      mark_hex=$(printf "0x%08x" "$MARK_DEC")
+      if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+        echo "XFRM state: present"
+      else
+        echo "XFRM state: missing"
+      fi
+      if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
+        echo -e "Tunnel: ${GRN}active${NC} (ping OK)"
+      else
+        # If ping fails but SA exists, still call it active-ish (may be filtered) and suggest force-fix
+        if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+          echo -e "Tunnel: ${YEL}active${NC} (SA OK, ping failed)"
+        else
+          echo -e "Tunnel: ${RED}inactive${NC}"
+        fi
+      fi
       echo "Tunnel IP: ${TUN_LOCAL_CIDR} -> ${TUN_REMOTE_IP}"
       echo "MARK/TABLE: ${MARK} / ${TABLE} (pref=${RULE_PREF:-})"
     else
