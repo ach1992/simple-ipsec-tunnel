@@ -40,6 +40,11 @@ DISABLE_RPFILTER_DEFAULT="yes"
 ENABLE_SRC_VALID_MARK_DEFAULT="yes"
 ENABLE_DISABLE_POLICY_DEFAULT="no"   # risky globally; per-iface only
 
+# Timeouts (slow/unstable networks may need more time)
+SYSTEMCTL_RESTART_TIMEOUT=180   # seconds
+IPSEC_UP_TIMEOUT=60             # seconds
+XFRM_WAIT_MAX=90                # seconds
+
 # Colors
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
 MAG="\033[0;35m"; CYA="\033[0;36m"; WHT="\033[1;37m"; NC="\033[0m"
@@ -519,8 +524,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 
-TimeoutStartSec=25
-TimeoutStopSec=15
+TimeoutStartSec=180
+TimeoutStopSec=30
 
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
@@ -622,7 +627,7 @@ start_ipsec() {
   # Retry bringing the connection up a few times to avoid "UP but no state yet" races.
   local i
   for i in 1 2 3; do
-    if timeout 25 ipsec up "${conn_name}" >/dev/null 2>&1; then
+    if timeout "${IPSEC_UP_TIMEOUT}" ipsec up "${conn_name}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -732,14 +737,14 @@ ensure_policy_routing
 start_ipsec
 
 # Wait briefly for XFRM state to appear (prevents "SA up but ping dead" race)
-for i in $(seq 1 25); do
+for i in $(seq 1 "$XFRM_WAIT_MAX"); do
   if ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
     break
   fi
 
   # Re-try ipsec up a couple of times while waiting (helps first-install readiness).
   if [[ "$i" -eq 8 || "$i" -eq 16 ]]; then
-    timeout 25 ipsec up "${conn_name}" >/dev/null 2>&1 || true
+    timeout "${IPSEC_UP_TIMEOUT}" ipsec up "${conn_name}" >/dev/null 2>&1 || true
   fi
 
   sleep 1
@@ -967,8 +972,7 @@ EOF
 
 enable_service() {
   local svc; svc="$(service_for "$1")"
-  systemctl enable "$svc" >/dev/null 2>&1 || true
-  systemctl start "$svc"  >/dev/null 2>&1 || true
+  systemctl enable --now "$svc" >/dev/null 2>&1 || true
 }
 stop_disable_service() {
   # stopping the service triggers ExecStop (down helper) which does cleanup
@@ -1224,7 +1228,16 @@ apply_tunnel_files_and_service() {
   write_sysctl_persist
 
   enable_service "$tun"
-  timeout 25 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
+
+  info "Applying IPsec service (starting in background)…"
+  systemctl restart --no-block "$(service_for "$tun")" >/dev/null 2>&1 || true
+
+  # Quick readiness hint (don't block user for long)
+  for _ in 1 2 3 4 5; do
+    systemctl is-active --quiet "$(service_for "$tun")" && break
+    sleep 1
+  done
+
   ipsec_reload_all
 }
 
@@ -1312,10 +1325,12 @@ do_status_one() {
   MARK_DEC="$(mark_to_dec "$MARK")"
   mark_hex=$(printf "0x%08x" "$MARK_DEC")
   if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-    echo -e "XFRM state: ${GRN}present${NC}"
-  else
-    echo -e "XFRM state: ${RED}missing${NC}"
-  fi
+  echo -e "XFRM state: ${GRN}present${NC}"
+elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+  echo -e "XFRM state: ${GRN}present${NC}"
+else
+  echo -e "XFRM state: ${RED}missing${NC}"
+fi
   if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
     echo -e "Ping: ${GRN}OK${NC} (${TUN_REMOTE_IP})"
   else
@@ -1375,10 +1390,12 @@ do_status_all() {
       MARK_DEC="$(mark_to_dec "$MARK")"
       mark_hex=$(printf "0x%08x" "$MARK_DEC")
       if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-        echo -e "XFRM state: ${GRN}present${NC}"
-      else
-        echo -e "XFRM state: ${RED}missing${NC}"
-      fi
+  echo -e "XFRM state: ${GRN}present${NC}"
+elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+  echo -e "XFRM state: ${GRN}present${NC}"
+else
+  echo -e "XFRM state: ${RED}missing${NC}"
+fi
 
       # Tunnel health
       if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
