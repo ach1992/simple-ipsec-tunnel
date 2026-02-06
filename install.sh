@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ==========================================
 # Simple IPsec Tunnel Installer (Debian/Ubuntu)
-# Repo: https://github.com/ach1992/simple-ipsec-tunnel
-#
-# Installs:
-#  - /usr/local/bin/simple-ipsec  (from ipsec_manager.sh)
-# ==========================================
-
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/ach1992/simple-ipsec-tunnel/main"
@@ -46,7 +39,7 @@ ensure_deps() {
   fi
 
   if ((${#missing_pkgs[@]} == 0)); then
-    ok "All dependencies already installed. (No apt-get update/install)"
+    ok "All dependencies already installed."
     return 0
   fi
 
@@ -59,7 +52,7 @@ ensure_deps() {
   warn "Missing packages: ${missing_pkgs[*]}"
   export DEBIAN_FRONTEND=noninteractive
 
-  log "Installing missing packages (no apt-get update)..."
+  log "Installing missing packages (trying without apt-get update first)..."
   if apt-get install -y "${missing_pkgs[@]}"; then
     ok "Installed missing packages."
   else
@@ -71,8 +64,7 @@ ensure_deps() {
 
   if ! have_cmd ipsec; then
     err "'ipsec' command still not found after install."
-    err "Check if it exists but PATH is wrong:"
-    err "  ls -l /usr/sbin/ipsec /sbin/ipsec"
+    err "Check paths: /usr/sbin/ipsec or /sbin/ipsec"
     err "PATH: $PATH"
     exit 1
   fi
@@ -81,7 +73,8 @@ ensure_deps() {
 download_script() {
   mkdir -p "$TMP_DIR"
   log "Downloading ${SCRIPT_NAME_IN_REPO}..."
-  curl -fsSL "${REPO_RAW_BASE}/${SCRIPT_NAME_IN_REPO}" -o "${TMP_DIR}/${SCRIPT_NAME_IN_REPO}"
+  # retry a few times for flaky networks
+  curl -fsSL --retry 5 --retry-delay 1 "${REPO_RAW_BASE}/${SCRIPT_NAME_IN_REPO}" -o "${TMP_DIR}/${SCRIPT_NAME_IN_REPO}"
   ok "Downloaded."
 }
 
