@@ -1518,7 +1518,6 @@ do_edit() {
   print_copy_block
 }
 
-
 do_force_fix_one() {
   choose_tunnel || return 0
   local tun="$SELECTED_TUN"
@@ -1527,45 +1526,71 @@ do_force_fix_one() {
   local svc
   svc="$(service_for "$tun")"
 
-  log "Force repair + ensure service enabled (non-blocking): $tun"
+  log "Force repair (restart -> wait short -> fix -> ping): $tun"
 
   systemctl enable "$svc" >/dev/null 2>&1 || true
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
 
+  # restart in background, but we will wait a short time for XFRM to appear
+  systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
+
+  # wait up to ~20s for xfrm state (prevents race)
+  local i mark_hex MARK_DEC
+  MARK_DEC="$(mark_to_dec "$MARK")"
+  mark_hex=$(printf "0x%08x" "$MARK_DEC")
+
+  for i in $(seq 1 20); do
+    ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}" && break
+    sleep 1
+  done
+
+  # now install policies AFTER state exists
   if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
     /usr/local/sbin/simple-ipsec-fix "$tun" >/dev/null 2>&1 || true
   fi
 
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
+  # quick ping check (does not block long)
+  if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
+    ok "Ping OK (${TUN_REMOTE_IP})"
+  else
+    warn "Ping still failing (${TUN_REMOTE_IP}). Check: ip -s xfrm state"
+  fi
 
-  sleep 2
+  echo
   do_status_one "$tun"
 }
 
-
 do_force_fix_all() {
-  local t svc
-  log "Force repair ALL tunnels + ensure services enabled (non-blocking start)"
+  local t svc i mark_hex MARK_DEC
+  log "Force repair ALL tunnels (restart -> short wait -> fix)"
 
+  # 1) restart all services first
   for t in $(list_tunnels); do
     read_conf "$t" || continue
     svc="$(service_for "$t")"
-
-    # enable + clear failed state
     systemctl enable "$svc" >/dev/null 2>&1 || true
     systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-
-    # optional fix helper
-    if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
-      /usr/local/sbin/simple-ipsec-fix "$t" >/dev/null 2>&1 || true
-    fi
-
-    # restart service without blocking the UI
     systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
   done
 
-  # short status check (doesn't block long)
-  sleep 3
+  # 2) after restarts, run fix per tunnel after its XFRM state exists
+  for t in $(list_tunnels); do
+    read_conf "$t" || continue
+
+    MARK_DEC="$(mark_to_dec "$MARK")"
+    mark_hex=$(printf "0x%08x" "$MARK_DEC")
+
+    for i in $(seq 1 20); do
+      ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}" && break
+      sleep 1
+    done
+
+    if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
+      /usr/local/sbin/simple-ipsec-fix "$t" >/dev/null 2>&1 || true
+    fi
+  done
+
+  sleep 2
   do_status_all
 }
 
