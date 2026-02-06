@@ -519,8 +519,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 
-TimeoutStartSec=180
-TimeoutStopSec=30
+TimeoutStartSec=25
+TimeoutStopSec=15
 
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
@@ -1522,51 +1522,31 @@ do_force_fix_one() {
   local tun="$SELECTED_TUN"
   read_conf "$tun" || { err "Config not found."; return; }
 
-  local svc
-  svc="$(service_for "$tun")"
-
-  log "Force repair + ensure service enabled (non-blocking): $tun"
-
-  systemctl enable "$svc" >/dev/null 2>&1 || true
-  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-
+  log "Force repair XFRM policies for: $tun"
   if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
-    /usr/local/sbin/simple-ipsec-fix "$tun" >/dev/null 2>&1 || true
+    /usr/local/sbin/simple-ipsec-fix "$tun" || true
+  else
+    warn "Fix helper not found; restarting service as fallback."
+    timeout 25 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
   fi
-
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
-
-  sleep 2
-  do_status_one "$tun"
 }
-
 
 do_force_fix_all() {
-  local t svc
-  log "Force repair ALL tunnels + ensure services enabled (non-blocking start)"
-
-  for t in $(list_tunnels); do
-    read_conf "$t" || continue
-    svc="$(service_for "$t")"
-
-    # enable + clear failed state
-    systemctl enable "$svc" >/dev/null 2>&1 || true
-    systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-
-    # optional fix helper
+  log "Force repair XFRM policies for ALL tunnels"
+  local t any="no"
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    any="yes"
     if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
-      /usr/local/sbin/simple-ipsec-fix "$t" >/dev/null 2>&1 || true
+      echo -e "${CYA}--- ${t} ---${NC}"
+      /usr/local/sbin/simple-ipsec-fix "$t" || true
+      echo
+    else
+      timeout 25 systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
     fi
-
-    # restart service without blocking the UI
-    systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
-  done
-
-  # short status check (doesn't block long)
-  sleep 3
-  do_status_all
+  done < <(list_tunnels)
+  [[ "$any" == "yes" ]] || warn "No tunnels configured."
 }
-
 
 do_delete() {
   choose_tunnel || return 0
