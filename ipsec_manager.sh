@@ -620,7 +620,17 @@ ensure_policy_routing() {
 start_ipsec() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
-  timeout 20 ipsec up "${conn_name}" >/dev/null 2>&1 || true
+
+  # On first install / fresh boot, strongSwan may not be fully ready.
+  # Retry bringing the connection up a few times to avoid "UP but no state yet" races.
+  local i
+  for i in 1 2 3; do
+    if timeout 25 ipsec up "${conn_name}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 0
 }
 
 # -----------------------
@@ -672,7 +682,7 @@ xfrm_reqid_from_state() {
     reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
         $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
         inblk && $1=="proto" && $2=="esp" {
-          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+          for(i=1;i<=NF;i++) if($i=="reqid") {v=$(i+1); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}}
           for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
         }
         inblk && /^$/ {inblk=0}
@@ -721,12 +731,19 @@ ensure_policy_routing
 start_ipsec
 
 # Wait briefly for XFRM state to appear (prevents "SA up but ping dead" race)
-for i in $(seq 1 12); do
+for i in $(seq 1 25); do
   if ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
     break
   fi
+
+  # Re-try ipsec up a couple of times while waiting (helps first-install readiness).
+  if [[ "$i" -eq 8 || "$i" -eq 16 ]]; then
+    timeout 25 ipsec up "${conn_name}" >/dev/null 2>&1 || true
+  fi
+
   sleep 1
 done
+
 
 # Critical fix: ensure ping over tunnel works deterministically (retry a few times)
 for i in $(seq 1 3); do
@@ -868,7 +885,7 @@ xfrm_reqid_from_state() {
     reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
         $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
         inblk && $1=="proto" && $2=="esp" {
-          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+          for(i=1;i<=NF;i++) if($i=="reqid") {v=$(i+1); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}}
           for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
         }
         inblk && /^$/ {inblk=0}
@@ -1228,7 +1245,7 @@ do_list() {
 }
 
 do_info() {
-  choose_tunnel || return
+  choose_tunnel || return 0
   local tun="$SELECTED_TUN"
   read_conf "$tun" || { err "Config not found."; return; }
 
@@ -1258,7 +1275,7 @@ do_info() {
 }
 
 do_status_one() {
-  choose_tunnel || return
+  choose_tunnel || return 0
   local tun="$SELECTED_TUN"
   read_conf "$tun" || { err "Config not found."; return; }
 
@@ -1374,7 +1391,7 @@ do_create() {
 }
 
 do_edit() {
-  choose_tunnel || return
+  choose_tunnel || return 0
   local old_tun="$SELECTED_TUN"
   read_conf "$old_tun" || { err "Config not found for: $old_tun"; return; }
 
@@ -1429,7 +1446,7 @@ do_edit() {
 
 
 do_force_fix_one() {
-  choose_tunnel || return
+  choose_tunnel || return 0
   local tun="$SELECTED_TUN"
   read_conf "$tun" || { err "Config not found."; return; }
 
@@ -1460,7 +1477,7 @@ do_force_fix_all() {
 }
 
 do_delete() {
-  choose_tunnel || return
+  choose_tunnel || return 0
   local tun="$SELECTED_TUN"
 
   warn "Delete tunnel '$tun' (service + interface + ipsec conn + secrets block + config + rules)."
@@ -1495,24 +1512,24 @@ menu() {
     echo -e "${CYA}3)${NC} Status (one tunnel)"
     echo -e "${CYA}4)${NC} Status (ALL tunnels)"
     echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
-    echo -e "${CYA}6)${NC} List tunnels"
-    echo -e "${CYA}7)${NC} Delete tunnel"
-    echo -e "${CYA}8)${NC} Force fix policies (one tunnel)"
-    echo -e "${CYA}9)${NC} Force fix policies (ALL tunnels)"
+    echo -e "${CYA}6)${NC} Force fix policies (one tunnel)"
+    echo -e "${CYA}7)${NC} Force fix policies (ALL tunnels)"
+    echo -e "${CYA}8)${NC} List tunnels"
+    echo -e "${CYA}9)${NC} Delete tunnel"
     echo -e "${CYA}0)${NC} Exit"
     echo -e "${MAG}----------------------------------------${NC}"
     local choice
     read -r -p "Select an option [0-9]: " choice || true
     case "${choice:-}" in
-      1) do_create; pause ;;
-      2) do_edit; pause ;;
-      3) do_status_one; pause ;;
-      4) do_status_all; pause ;;
-      5) do_info; pause ;;
-      6) do_list; pause ;;
-      7) do_delete; pause ;;      8) do_force_fix_one; pause ;;
-      9) do_force_fix_all; pause ;;
-
+      1) do_create || true; pause ;;
+      2) do_edit || true; pause ;;
+      3) do_status_one || true; pause ;;
+      4) do_status_all || true; pause ;;
+      5) do_info || true; pause ;;
+      6) do_force_fix_one || true; pause ;;
+      7) do_force_fix_all || true; pause ;;
+      8) do_list || true; pause ;;
+      9) do_delete || true; pause ;;
       0) exit 0 ;;
       *) err "Invalid selection."; pause ;;
     esac
