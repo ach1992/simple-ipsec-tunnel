@@ -72,6 +72,18 @@ ensure_deps() {
 
 download_script() {
   mkdir -p "$TMP_DIR"
+
+  # If ipsec_manager.sh is present next to this installer, use it (offline/local install)
+  local self_dir local_src
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  local_src="${self_dir}/${SCRIPT_NAME_IN_REPO}"
+  if [[ -f "$local_src" ]]; then
+    log "Using local ${SCRIPT_NAME_IN_REPO} from: $local_src"
+    cp -a "$local_src" "${TMP_DIR}/${SCRIPT_NAME_IN_REPO}"
+    ok "Copied locally."
+    return 0
+  fi
+
   log "Downloading ${SCRIPT_NAME_IN_REPO}..."
   # retry a few times for flaky networks
   curl -fsSL --retry 5 --retry-delay 1 "${REPO_RAW_BASE}/${SCRIPT_NAME_IN_REPO}" -o "${TMP_DIR}/${SCRIPT_NAME_IN_REPO}"
