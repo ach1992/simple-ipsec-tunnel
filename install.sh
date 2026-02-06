@@ -36,7 +36,24 @@ ensure_deps() {
   have_cmd flock   || missing_pkgs+=("util-linux")
 
   if ! have_cmd ipsec; then
-    missing_pkgs+=("strongswan" "strongswan-starter")
+    # Debian 13 (trixie) note:
+    # - "strongswan" metapackage focuses on swanctl
+    # - for ipsec.conf/starter you typically need strongswan-starter + strongswan-charon (+ strongswan-libcharon which includes socket-default)
+    if have_cmd apt-cache && apt-cache show strongswan-charon >/dev/null 2>&1; then
+      missing_pkgs+=("strongswan-charon")
+    else
+      missing_pkgs+=("strongswan")
+    fi
+
+    # starter is required for ipsec.conf flows (and is a dependency of strongswan-charon on Debian)
+    if have_cmd apt-cache && apt-cache show strongswan-starter >/dev/null 2>&1; then
+      missing_pkgs+=("strongswan-starter")
+    fi
+
+    # on Debian, socket-default plugin lives in strongswan-libcharon
+    if have_cmd apt-cache && apt-cache show strongswan-libcharon >/dev/null 2>&1; then
+      missing_pkgs+=("strongswan-libcharon")
+    fi
   fi
 
   if ((${#missing_pkgs[@]} == 0)); then
