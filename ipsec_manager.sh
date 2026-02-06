@@ -1007,9 +1007,14 @@ enable_service() {
 }
 
 stop_disable_service() {
-  # stopping the service triggers ExecStop (down helper) which does cleanup
-  systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
-  systemctl disable "$(service_for "$1")" >/dev/null 2>&1 || true
+  local svc
+  svc="$(service_for "$1")"
+
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  systemctl disable "$svc" >/dev/null 2>&1 || true
+
+  # خیلی مهم: اگر instance fail شده باشد، در list-units می‌ماند
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
 }
 
 ipsec_reload_all() {
@@ -1273,19 +1278,61 @@ apply_tunnel_files_and_service() {
   ipsec_reload_all
 }
 
+iptables_delete_all_marks_for_if() {
+  local ifc="$1"
+  local line
+
+  while true; do
+    line="$(iptables -t mangle -S OUTPUT 2>/dev/null | grep -E -- "-o ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
+    [[ -z "$line" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(iptables -t mangle -S PREROUTING 2>/dev/null | grep -E -- "-i ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
+    [[ -z "$line" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+}
+
+delete_ip_rules_for_mark_table() {
+  local mark_dec="$1"
+  local table="$2"
+
+  # هر rule که fwmark=mark_dec و lookup table دارد حذف می‌کنیم
+  ip rule show | awk -v m="$mark_dec" -v t="$table" '
+    $0 ~ ("fwmark " m) && $0 ~ (" lookup " t) {print $1}
+  ' | sed 's/://' | while read -r pref; do
+    ip rule del pref "$pref" 2>/dev/null || true
+  done
+}
+
 remove_tunnel_everything() {
   local tun="$1"
   read_conf "$tun" || true
 
-  # Stop service (ExecStop runs down helper -> cleanup)
+  local ifc="${TUN_NAME:-$tun}"
+  local mark_dec=""
+  local table="${TABLE:-220}"
+
+  if [[ -n "${MARK:-}" ]]; then
+    mark_dec="$(mark_to_dec "${MARK}")"
+  fi
+
   stop_disable_service "$tun"
 
-  # Extra safety cleanup even if systemd/ExecStop was not effective
-  local ifc="${TUN_NAME:-$tun}"
-  iptables -t mangle -D OUTPUT -o "${ifc}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
-  iptables -t mangle -D PREROUTING -i "${ifc}" -j MARK --set-xmark "${MARK:-0}/0xffffffff" 2>/dev/null || true
-  ip link set "${ifc}" down >/dev/null 2>&1 || true
-  ip link del "${ifc}" >/dev/null 2>&1 || true
+  if [[ -x /usr/local/sbin/simple-ipsec-down ]]; then
+    /usr/local/sbin/simple-ipsec-down "$tun" >/dev/null 2>&1 || true
+  fi
+
+  iptables_delete_all_marks_for_if "$ifc"
+
+  if [[ -n "${mark_dec:-}" ]]; then
+    delete_ip_rules_for_mark_table "$mark_dec" "$table"
+  fi
+
+  ip link set "$ifc" down >/dev/null 2>&1 || true
+  ip link del "$ifc" >/dev/null 2>&1 || true
 
   rm -f "$(ipsec_conn_conf_for "$tun")" >/dev/null 2>&1 || true
   remove_secrets_block "$tun"
