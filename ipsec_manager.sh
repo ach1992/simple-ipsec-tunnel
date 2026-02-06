@@ -286,12 +286,9 @@ prompt_paste_copy_block() {
   echo
 
   local first=""
-  echo -e "${YEL}Paste the COPY BLOCK now.${NC}"
-  echo -e "When you're done, press ${WHT}Enter twice${NC} on empty lines to finish."
-  echo
-  read -r -p "Paste first line (or just Enter to skip): " first || true
+  read -r -p "Paste the COPY BLOCK (or just Enter to skip): " first || true
   [[ -n "${first:-}" ]] || return 0
-
+  
   local lines=("$first") empty_count=0 line
   while true; do
     line=""
