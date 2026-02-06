@@ -789,9 +789,13 @@ cleanup_iptables_mangle_rules() {
 }
 
 cleanup_xfrm_policies() {
-  local lip rip
+  local lip rip mark_dec_effective
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
+
+  # prefer REAL mark from xfrm state (fall back to config mark)
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
 
   # best-effort delete old policies (with and without mark) to avoid "File exists"
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
@@ -964,7 +968,11 @@ EOF
   systemctl daemon-reload
 }
 
-enable_service() { systemctl enable --now "$(service_for "$1")" >/dev/null 2>&1 || true; }
+enable_service() {
+  local svc; svc="$(service_for "$1")"
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  systemctl start "$svc"  >/dev/null 2>&1 || true
+}
 stop_disable_service() {
   # stopping the service triggers ExecStop (down helper) which does cleanup
   systemctl stop "$(service_for "$1")" >/dev/null 2>&1 || true
@@ -1292,6 +1300,31 @@ do_status_one() {
   read_conf "$tun" || { err "Config not found."; return; }
 
   echo -e "${MAG}===== Status: ${tun} =====${NC}"
+  local svc mark_hex MARK_DEC
+  svc="$(service_for "$tun")"
+  if systemctl is-active --quiet "$svc"; then
+    echo -e "Service: ${GRN}active${NC}"
+  else
+    echo -e "Service: ${RED}inactive${NC}"
+  fi
+  if ip link show "$tun" >/dev/null 2>&1; then
+    echo -e "Interface: ${GRN}present${NC}"
+  else
+    echo -e "Interface: ${RED}missing${NC}"
+  fi
+  MARK_DEC="$(mark_to_dec "$MARK")"
+  mark_hex=$(printf "0x%08x" "$MARK_DEC")
+  if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+    echo -e "XFRM state: ${GRN}present${NC}"
+  else
+    echo -e "XFRM state: ${RED}missing${NC}"
+  fi
+  if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
+    echo -e "Ping: ${GRN}OK${NC} (${TUN_REMOTE_IP})"
+  else
+    echo -e "Ping: ${RED}FAIL${NC} (${TUN_REMOTE_IP})"
+  fi
+  echo
   echo -e "${WHT}Service:${NC}"
   systemctl --no-pager --full status "$(service_for "$tun")" || true
   echo
@@ -1325,26 +1358,38 @@ do_status_all() {
     any="yes"
     echo -e "${CYA}--- ${t} ---${NC}"
     if read_conf "$t"; then
-      systemctl is-active --quiet "$(service_for "$t")" && echo "Service: active" || echo "Service: inactive"
-      ip link show "$t" >/dev/null 2>&1 && echo "Interface: present" || echo "Interface: missing"
-      # Tunnel health: consider ACTIVE if SA exists for this mark and ping works
-      local mark_hex
+      local svc mark_hex MARK_DEC
+      svc="$(service_for "$t")"
+
+      # Service status (systemd oneshot may be "active (exited)" after a successful start)
+      if systemctl is-active --quiet "$svc"; then
+        echo -e "Service: ${GRN}active${NC}"
+      else
+        echo -e "Service: ${RED}inactive${NC}"
+      fi
+
+      if ip link show "$t" >/dev/null 2>&1; then
+        echo -e "Interface: ${GRN}present${NC}"
+      else
+        echo -e "Interface: ${RED}missing${NC}"
+      fi
+
+      # XFRM state for this tunnel mark
+      MARK_DEC="$(mark_to_dec "$MARK")"
       mark_hex=$(printf "0x%08x" "$MARK_DEC")
       if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-        echo "XFRM state: present"
+        echo -e "XFRM state: ${GRN}present${NC}"
       else
-        echo "XFRM state: missing"
+        echo -e "XFRM state: ${RED}missing${NC}"
       fi
+
+      # Tunnel health
       if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
         echo -e "Tunnel: ${GRN}active${NC} (ping OK)"
       else
-        # If ping fails but SA exists, still call it active-ish (may be filtered) and suggest force-fix
-        if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
-          echo -e "Tunnel: ${YEL}active${NC} (SA OK, ping failed)"
-        else
-          echo -e "Tunnel: ${RED}inactive${NC}"
-        fi
+        echo -e "Tunnel: ${RED}inactive${NC} (ping failed)"
       fi
+
       echo "Tunnel IP: ${TUN_LOCAL_CIDR} -> ${TUN_REMOTE_IP}"
       echo "MARK/TABLE: ${MARK} / ${TABLE} (pref=${RULE_PREF:-})"
     else
