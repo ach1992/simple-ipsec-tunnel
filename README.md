@@ -23,7 +23,7 @@ It is designed to feel like a **Simple GRE** workflow:
   - Info + COPY BLOCK
   - List
   - Delete
-  - **Force fix policies (one / all)** ✅ *(new)*
+  - **Force fix policies (one / all)** ✅
 - ✅ Per tunnel configs:
   - `/etc/simple-ipsec/tunnels.d/<TUN_NAME>.conf`
 - ✅ Per tunnel strongSwan connection:
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/ach1992/simple-ipsec-tunnel/main/in
 sudo simple-ipsec
 ```
 
-### Option B — Local install (offline / patched)
+### Option B — Local install (offline)
 If you have `install.sh` and `ipsec_manager.sh` in the same folder:
 ```bash
 sudo bash install.sh
