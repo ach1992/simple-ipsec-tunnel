@@ -1311,7 +1311,7 @@ do_status_one() {
   fi
   MARK_DEC="$(mark_to_dec "$MARK")"
   mark_hex=$(printf "0x%08x" "$MARK_DEC")
-  if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+  if ip xfrm state 2>/dev/null | grep -Eq "mark (${mark_hex}|${MARK_DEC})(/0xffffffff)?"; then
     echo -e "XFRM state: ${GRN}present${NC}"
   else
     echo -e "XFRM state: ${RED}missing${NC}"
@@ -1374,7 +1374,7 @@ do_status_all() {
       # XFRM state for this tunnel mark
       MARK_DEC="$(mark_to_dec "$MARK")"
       mark_hex=$(printf "0x%08x" "$MARK_DEC")
-      if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+      if ip xfrm state 2>/dev/null | grep -Eq "mark (${mark_hex}|${MARK_DEC})(/0xffffffff)?"; then
         echo -e "XFRM state: ${GRN}present${NC}"
       else
         echo -e "XFRM state: ${RED}missing${NC}"
