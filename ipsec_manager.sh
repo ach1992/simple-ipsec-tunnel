@@ -658,8 +658,12 @@ xfrm_reqid_from_state() {
   reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
       $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
       inblk && $1=="proto" && $2=="esp" {
-        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
-        for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
+        for(i=1;i<=NF;i++) if($i=="reqid") {
+          v=$(i+1); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}
+        }
+        for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {
+          v=$(i); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}
+        }
       }
       inblk && /^$/ {inblk=0}
     ' | head -n1
@@ -850,8 +854,12 @@ xfrm_reqid_from_state() {
   reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
       $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
       inblk && $1=="proto" && $2=="esp" {
-        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
-        for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
+        for(i=1;i<=NF;i++) if($i=="reqid") {
+          v=$(i+1); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}
+        }
+        for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {
+          v=$(i); sub(/\(.*/,"",v); gsub(/[^0-9]/,"",v); if(v!=""){print v; exit}
+        }
       }
       inblk && /^$/ {inblk=0}
     ' | head -n1
