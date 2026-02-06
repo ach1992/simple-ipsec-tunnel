@@ -969,6 +969,7 @@ cleanup_policy_routing() {
 
   ip rule del pref "${pref}" 2>/dev/null || true
   ip route del "${subnet}" table "${TABLE}" 2>/dev/null || true
+  ip -4 route del "${subnet}" dev "${TUN_NAME}" 2>/dev/null || true
   ip route flush cache >/dev/null 2>&1 || true
 }
 
