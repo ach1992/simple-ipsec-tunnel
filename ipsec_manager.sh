@@ -700,6 +700,27 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
+ensure_tunnel_routes() {
+  # route the /30 tunnel subnet via vti, otherwise traffic never goes "out vti"
+  local subnet
+  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
+
+  # Main routing table (important!)
+  ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
+
+  # Optional: keep your policy-routing table consistent with design
+  local mark_dec pref
+  mark_dec="$(mark_to_dec "${MARK}")"
+  pref="${RULE_PREF:-}"
+  [[ -n "${pref:-}" ]] || pref=10000
+
+  ip rule show | grep -qE "pref ${pref} .*fwmark ${mark_dec} .*lookup ${TABLE}" \
+    || ip rule add pref "${pref}" fwmark "${mark_dec}" lookup "${TABLE}" 2>/dev/null || true
+
+  ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link table "${TABLE}" 2>/dev/null || true
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
 ensure_mangle_mark_rules() {
   iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
@@ -838,6 +859,7 @@ if ! wait_for_local_ip; then
 fi
 
 ensure_vti
+ensure_tunnel_routes
 ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
