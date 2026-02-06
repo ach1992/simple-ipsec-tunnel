@@ -1229,7 +1229,7 @@ apply_tunnel_files_and_service() {
 
   enable_service "$tun"
 
-  info "Applying IPsec service (starting in background)…"
+  log "Applying IPsec service..."
   systemctl restart --no-block "$(service_for "$tun")" >/dev/null 2>&1 || true
 
   # Quick readiness hint (don't block user for long)
