@@ -33,6 +33,7 @@ ensure_deps() {
   have_cmd ping     || missing_pkgs+=("iputils-ping")
   have_cmd timeout  || missing_pkgs+=("coreutils")
   have_cmd iptables || missing_pkgs+=("iptables")
+  have_cmd flock   || missing_pkgs+=("util-linux")
 
   if ! have_cmd ipsec; then
     missing_pkgs+=("strongswan" "strongswan-starter")
