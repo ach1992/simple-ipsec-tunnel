@@ -1525,8 +1525,6 @@ do_force_fix_one() {
   log "Force repair XFRM policies for: $tun"
   if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
     /usr/local/sbin/simple-ipsec-fix "$tun" || true
-    systemctl enable "$svc" >/dev/null 2>&1 || true
-    systemctl reset-failed "$svc" >/dev/null 2>&1 || true
   else
     warn "Fix helper not found; restarting service as fallback."
     timeout 25 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
@@ -1542,8 +1540,6 @@ do_force_fix_all() {
     if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
       echo -e "${CYA}--- ${t} ---${NC}"
       /usr/local/sbin/simple-ipsec-fix "$t" || true
-      systemctl enable "$svc" >/dev/null 2>&1 || true
-      systemctl reset-failed "$svc" >/dev/null 2>&1 || true
       echo
     else
       timeout 25 systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
