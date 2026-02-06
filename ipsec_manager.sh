@@ -716,8 +716,19 @@ ensure_mangle_mark_rules
 ensure_policy_routing
 start_ipsec
 
-# Critical fix: ensure ping over tunnel works deterministically
-xfrm_policy_install_tunnel_ips || true
+# Wait briefly for XFRM state to appear (prevents "SA up but ping dead" race)
+for i in $(seq 1 12); do
+  if ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+    break
+  fi
+  sleep 1
+done
+
+# Critical fix: ensure ping over tunnel works deterministically (retry a few times)
+for i in $(seq 1 3); do
+  xfrm_policy_install_tunnel_ips && break || true
+  sleep 1
+done
 EOF
 
   # -----------------------
@@ -785,7 +796,134 @@ ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
 EOF
 
-  chmod +x "$UP_HELPER" "$DOWN_HELPER" || true
+
+  # -----------------------
+  # FIX helper (force XFRM policy repair)
+  # -----------------------
+  FIX_HELPER="/usr/local/sbin/simple-ipsec-fix"
+  cat >"$FIX_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/etc/simple-ipsec"
+TUNNELS_DIR="$APP_DIR/tunnels.d"
+
+tun="${1:-}"
+[[ -n "${tun}" ]] || { echo "Usage: simple-ipsec-fix <tunnel_name>" >&2; exit 2; }
+
+CONF_FILE="$TUNNELS_DIR/${tun}.conf"
+[[ -f "$CONF_FILE" ]] || { echo "Config not found: $CONF_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+
+conn_name="simple-ipsec-${tun}"
+
+mark_to_dec() {
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
+local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
+
+xfrm_state_mark_dec() {
+  local m=""
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="mark" {print $2; exit}
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${m:-}" ]]; then
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="mark" {print $2; exit}
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${m:-}" ]] || return 0
+  m="${m%%/*}"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
+
+xfrm_reqid_from_state() {
+  local reqid=""
+  reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="proto" && $2=="esp" {
+        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+        for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
+      }
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${reqid:-}" ]]; then
+    reqid="$(ip -s xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="proto" && $2=="esp" {
+          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+          for(i=1;i<=NF;i++) if($(i) ~ /^reqid/) {gsub(/[^0-9]/,"",$(i)); if($(i)!=""){print $(i); exit}}
+        }
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${reqid:-}" ]] || return 0
+  echo "$reqid"
+}
+
+xfrm_policy_install_tunnel_ips() {
+  local lip rip reqid mark_dec_effective
+  lip="$(local_tun_ip)"
+  rip="${TUN_REMOTE_IP}"
+
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+
+  reqid="$(xfrm_reqid_from_state || true)"
+  [[ -n "${reqid:-}" ]] || reqid="1"
+
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
+
+  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+
+  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in  \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}"  proto esp reqid "${reqid}" mode tunnel
+
+  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel
+}
+
+echo "[INFO] Ensuring IPsec is up (best-effort)..."
+timeout 15 ipsec up "${conn_name}" >/dev/null 2>&1 || true
+
+echo "[INFO] Waiting for XFRM state to appear..."
+for i in $(seq 1 12); do
+  if ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+    break
+  fi
+  sleep 1
+done
+
+echo "[INFO] Installing XFRM policies for tunnel IPs..."
+for i in $(seq 1 3); do
+  xfrm_policy_install_tunnel_ips && break || true
+  sleep 1
+done
+
+echo "[INFO] Current tunnel policies:"
+ip xfrm policy 2>/dev/null | egrep -n "$(echo "${TUN_LOCAL_CIDR%%/*}" | sed 's/\./\\./g')|$(echo "${TUN_REMOTE_IP}" | sed 's/\./\\./g')" || true
+
+echo "[INFO] Ping test: ${TUN_REMOTE_IP}"
+ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && echo "[OK] Ping OK." || echo "[WARN] Ping failed (check SA counters: ip -s xfrm state)."
+EOF
+
+  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" || true
   systemctl daemon-reload
 }
 
@@ -1281,6 +1419,38 @@ do_edit() {
   print_copy_block
 }
 
+
+do_force_fix_one() {
+  choose_tunnel || return
+  local tun="$SELECTED_TUN"
+  read_conf "$tun" || { err "Config not found."; return; }
+
+  log "Force repair XFRM policies for: $tun"
+  if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
+    /usr/local/sbin/simple-ipsec-fix "$tun" || true
+  else
+    warn "Fix helper not found; restarting service as fallback."
+    timeout 25 systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
+  fi
+}
+
+do_force_fix_all() {
+  log "Force repair XFRM policies for ALL tunnels"
+  local t any="no"
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    any="yes"
+    if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
+      echo -e "${CYA}--- ${t} ---${NC}"
+      /usr/local/sbin/simple-ipsec-fix "$t" || true
+      echo
+    else
+      timeout 25 systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
+    fi
+  done < <(list_tunnels)
+  [[ "$any" == "yes" ]] || warn "No tunnels configured."
+}
+
 do_delete() {
   choose_tunnel || return
   local tun="$SELECTED_TUN"
@@ -1319,10 +1489,12 @@ menu() {
     echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
     echo -e "${CYA}6)${NC} List tunnels"
     echo -e "${CYA}7)${NC} Delete tunnel"
+    echo -e "${CYA}8)${NC} Force fix policies (one tunnel)"
+    echo -e "${CYA}9)${NC} Force fix policies (ALL tunnels)"
     echo -e "${CYA}0)${NC} Exit"
     echo -e "${MAG}----------------------------------------${NC}"
     local choice
-    read -r -p "Select an option [0-7]: " choice || true
+    read -r -p "Select an option [0-9]: " choice || true
     case "${choice:-}" in
       1) do_create; pause ;;
       2) do_edit; pause ;;
@@ -1330,7 +1502,9 @@ menu() {
       4) do_status_all; pause ;;
       5) do_info; pause ;;
       6) do_list; pause ;;
-      7) do_delete; pause ;;
+      7) do_delete; pause ;;      8) do_force_fix_one; pause ;;
+      9) do_force_fix_all; pause ;;
+
       0) exit 0 ;;
       *) err "Invalid selection."; pause ;;
     esac
