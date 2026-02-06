@@ -56,6 +56,17 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 pause() { read -r -p "Press Enter to continue..." _ || true; }
 
+# -----------------------
+# Global lock to avoid races between create/delete/restart
+# -----------------------
+with_lock() {
+  local lock="/run/simple-ipsec.lock"
+  mkdir -p /run 2>/dev/null || true
+  exec 9>"$lock"
+  flock -x 9
+  "$@"
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     err "Run as root."
@@ -1270,7 +1281,7 @@ apply_tunnel_files_and_service() {
   systemctl restart --no-block "$(service_for "$tun")" >/dev/null 2>&1 || true
 
   # Quick readiness hint (don't block user for long)
-  for _ in 1 2 3 4 5; do
+  for _ in 1 2 3; do
     systemctl is-active --quiet "$(service_for "$tun")" && break
     sleep 1
   done
@@ -1307,6 +1318,21 @@ delete_ip_rules_for_mark_table() {
   done
 }
 
+delete_routes_for_if_in_table() {
+  local ifc="$1"
+  local table="$2"
+
+  # Remove any routes in table that point to this interface (best-effort)
+  ip -4 route show table "$table" 2>/dev/null | awk -v dev="$ifc" '
+    $0 ~ (" dev " dev) {print}
+  ' | while read -r line; do
+    # line is a full route entry, delete it
+    ip -4 route del table "$table" $line 2>/dev/null || true
+  done
+
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
 remove_tunnel_everything() {
   local tun="$1"
   read_conf "$tun" || true
@@ -1330,6 +1356,8 @@ remove_tunnel_everything() {
   if [[ -n "${mark_dec:-}" ]]; then
     delete_ip_rules_for_mark_table "$mark_dec" "$table"
   fi
+  # also delete any leftover routes in the table pointing to this interface
+  delete_routes_for_if_in_table "$ifc" "$table"
 
   ip link set "$ifc" down >/dev/null 2>&1 || true
   ip link del "$ifc" >/dev/null 2>&1 || true
@@ -1548,7 +1576,7 @@ do_create() {
 
   ensure_strongswan_includes
   ensure_systemd_template
-  apply_tunnel_files_and_service "$TUN_NAME"
+  with_lock apply_tunnel_files_and_service "$TUN_NAME"
 
   ok "Tunnel '${TUN_NAME}' created & applied."
   echo
@@ -1602,12 +1630,12 @@ do_edit() {
 
   if [[ "$TUN_NAME" != "$old_tun" ]]; then
     warn "Renaming tunnel: ${old_tun} -> ${TUN_NAME}"
-    remove_tunnel_everything "$old_tun"
+    with_lock remove_tunnel_everything "$old_tun"
   else
-    stop_disable_service "$old_tun" >/dev/null 2>&1 || true
+    with_lock stop_disable_service "$old_tun" >/dev/null 2>&1 || true
   fi
 
-  apply_tunnel_files_and_service "$TUN_NAME"
+  with_lock apply_tunnel_files_and_service "$TUN_NAME"
 
   ok "Tunnel updated & applied: ${TUN_NAME}"
   echo
@@ -1663,7 +1691,7 @@ do_delete() {
     esac
   done
 
-  remove_tunnel_everything "$tun"
+  with_lock remove_tunnel_everything "$tun"
   ok "Deleted tunnel: $tun"
 }
 
