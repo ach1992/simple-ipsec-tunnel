@@ -50,6 +50,10 @@ ensure_deps() {
       missing_pkgs+=("strongswan-starter")
     fi
 
+    if have_cmd apt-cache && apt-cache show strongswan-libcharon >/dev/null 2>&1; then
+      missing_pkgs+=("strongswan-libcharon")
+    fi
+
     # on Debian, socket-default plugin lives in strongswan-libcharon
     if have_cmd apt-cache && apt-cache show strongswan-libcharon >/dev/null 2>&1; then
       missing_pkgs+=("strongswan-libcharon")
