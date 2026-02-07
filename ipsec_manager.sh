@@ -729,15 +729,18 @@ ensure_vti() {
 }
 
 ensure_tunnel_routes() {
-  # This function is temporarily disabled for testing.
-  # It does nothing and always returns success.
-  true
+  local subnet
+  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
+  ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
+  ip route flush cache >/dev/null 2>&1 || true
 }
 
 ensure_mangle_mark_rules() {
-  # This function is temporarily disabled for testing.
-  # It does nothing and always returns success.
-  true
+  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff"
+
+  iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
+    || iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
 }
 
 xfrm_state_present() {
@@ -986,7 +989,7 @@ cleanup_firewall_rules() {
 }
 
 cleanup_iptables_mangle_rules() {
-  iptables -t mangle -D OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
 }
 
