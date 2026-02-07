@@ -729,10 +729,7 @@ ensure_vti() {
 }
 
 ensure_tunnel_routes() {
-  local subnet
-  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
-  ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
-  ip route flush cache >/dev/null 2>&1 || true
+  true
 }
 
 ensure_mangle_mark_rules() {
