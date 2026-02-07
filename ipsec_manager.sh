@@ -615,7 +615,6 @@ ensure_kernel_modules() {
 }
 
 detect_strongswan_unit() {
-  # Return unit name if exists, else empty
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl cat strongswan-starter.service >/dev/null 2>&1; then
       echo "strongswan-starter.service"; return 0
@@ -630,20 +629,16 @@ detect_strongswan_unit() {
 ensure_strongswan_running_and_healthy() {
   local unit
   unit="$(detect_strongswan_unit)"
-
   if [[ -n "$unit" ]]; then
     systemctl start "$unit" >/dev/null 2>&1 || true
   fi
-
-  # Verify daemon health via ipsec statusall (works across 5.x/6.x)
   if ! timeout 5 ipsec statusall >/dev/null 2>&1; then
     err "strongSwan seems not healthy (ipsec statusall failed)."
     if [[ -n "$unit" ]]; then
       warn "systemd status: $unit"
       systemctl --no-pager --full status "$unit" || true
       if command -v journalctl >/dev/null 2>&1; then
-        echo
-        warn "Recent strongSwan logs:"
+        echo; warn "Recent strongSwan logs:"
         journalctl -u "$unit" -n 120 --no-pager || true
       fi
     else
@@ -665,21 +660,16 @@ wait_for_local_ip() {
 }
 
 apply_sysctl() {
-  # Load our file explicitly (sysctl --system ignores /etc/simple-ipsec by default)
   [[ -f "$SYSCTL_FILE" ]] && sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-
   [[ "${ENABLE_FORWARDING:-no}" == "yes" ]] && sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-
   if [[ "${ENABLE_SRC_VALID_MARK:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
   fi
-
   if [[ "${DISABLE_RPFILTER:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
     sysctl -w "net.ipv4.conf.${TUN_NAME}.rp_filter=0" >/dev/null 2>&1 || true
   fi
-
   if [[ "${ENABLE_DISABLE_POLICY:-no}" == "yes" ]]; then
     sysctl -w "net.ipv4.conf.${TUN_NAME}.disable_policy=1" >/dev/null 2>&1 || true
   fi
@@ -687,26 +677,13 @@ apply_sysctl() {
 
 ensure_firewall_rules() {
     log "Ensuring firewall rules for IPsec..."
-
-    # --- Highest Priority Rule ---
-    # Allow all traffic that is part of an already established connection.
-    # This is a standard best practice for stateful firewalls.
     iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
     iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    # --- Rules for establishing NEW connections ---
-    # Allow IKE and NAT-T for new tunnel negotiations.
     iptables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -p udp --dport 500 -j ACCEPT
     iptables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p udp --dport 4500 -j ACCEPT
-
-    # Allow ESP protocol for the encrypted data itself.
     iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p esp -j ACCEPT
-
-    # --- Rules for Forwarding new traffic from the tunnel ---
-    # This allows new connections initiated from the tunnel side to pass through.
     iptables -C FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 2 -i "${TUN_NAME}" -j ACCEPT
     iptables -C FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 3 -o "${TUN_NAME}" -j ACCEPT
 }
@@ -714,13 +691,10 @@ ensure_firewall_rules() {
 ensure_vti() {
   local key_dec
   key_dec="$(mark_to_dec "${MARK}")"
-
-  # Recreate every time to avoid stale endpoints/keys after edits
   if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
     ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
     ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
   fi
-
   ip link add "${TUN_NAME}" type vti local "${LOCAL_WAN_IP}" remote "${REMOTE_WAN_IP}" key "${key_dec}"
   ip link set "${TUN_NAME}" mtu "${MTU}" >/dev/null 2>&1 || true
   ip addr flush dev "${TUN_NAME}" >/dev/null 2>&1 || true
@@ -728,10 +702,9 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-nsure_tunnel_routes() {
+ensure_tunnel_routes() {
   local subnet
   subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
-
   ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
   ip route flush cache >/dev/null 2>&1 || true
 }
@@ -739,7 +712,6 @@ nsure_tunnel_routes() {
 ensure_mangle_mark_rules() {
   iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
-
   iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
 }
@@ -760,7 +732,6 @@ wait_for_xfrm_state() {
 start_ipsec_or_fail() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
-
   local i
   for i in $(seq 1 "${IPSEC_UP_TRIES}"); do
     log "Bringing up IPsec: ${conn_name} (try ${i}/${IPSEC_UP_TRIES})..."
@@ -770,129 +741,62 @@ start_ipsec_or_fail() {
     warn "ipsec up failed (try ${i})."
     sleep 1
   done
-
   err "IPsec did not come up."
-  echo
-  warn "ipsec statusall (top):"
+  echo; warn "ipsec statusall (top):"
   timeout 8 ipsec statusall | sed -n '1,140p' || true
   exit 1
 }
 
 xfrm_state_mark_dec() {
-  # Try both directions; return decimal mark or empty
-  local m=""
-  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
-      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
-      inblk && $1=="mark" {print $2; exit}
-      inblk && /^$/ {inblk=0}
-    ' | head -n1
-  )"
+  local m
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" ' $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1} inblk && $1=="mark" {print $2; exit} inblk && /^$/ {inblk=0} ' | head -n1)"
   if [[ -z "${m:-}" ]]; then
-    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
-        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
-        inblk && $1=="mark" {print $2; exit}
-        inblk && /^$/ {inblk=0}
-      ' | head -n1
-    )"
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" ' $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1} inblk && $1=="mark" {print $2; exit} inblk && /^$/ {inblk=0} ' | head -n1)"
   fi
   [[ -n "${m:-}" ]] || return 0
-  m="${m%%/*}"
-  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+  m="${m%%/*}"; if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 
 xfrm_reqid_from_state() {
-  # Return numeric reqid from a matching ESP state (either direction)
-  local reqid=""
-  reqid="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
-      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
-      inblk && $1=="proto" && $2=="esp" {
-        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
-      }
-      inblk && /^$/ {inblk=0}
-    ' | head -n1
-  )"
+  local reqid
+  reqid="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" ' $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1} inblk && $1=="proto" && $2=="esp" { for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit} } inblk && /^$/ {inblk=0} ' | head -n1)"
   if [[ -z "${reqid:-}" ]]; then
-    reqid="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
-        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
-        inblk && $1=="proto" && $2=="esp" {
-          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
-        }
-        inblk && /^$/ {inblk=0}
-      ' | head -n1
-    )"
+    reqid="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" ' $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1} inblk && $1=="proto" && $2=="esp" { for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit} } inblk && /^$/ {inblk=0} ' | head -n1)"
   fi
-  reqid="${reqid%%(*}"
-  reqid="${reqid//[^0-9]/}"
-  [[ -n "${reqid:-}" ]] || return 0
-  echo "$reqid"
+  reqid="${reqid%%(*}"; reqid="${reqid//[^0-9]/}"; [[ -n "${reqid:-}" ]] || return 0; echo "$reqid"
 }
 
 xfrm_policy_install_tunnel_ips() {
   local lip rip reqid mark_dec_effective
-  lip="$(local_tun_ip)"
-  rip="${TUN_REMOTE_IP}"
-
-  # prefer REAL mark from xfrm state (fall back to config mark)
-  mark_dec_effective="$(xfrm_state_mark_dec || true)"
-  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
-
-  reqid="$(xfrm_reqid_from_state || true)"
-  [[ -n "${reqid:-}" ]] || reqid="1"
-
-  # best-effort delete old policies (with and without mark)
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  lip="$(local_tun_ip)"; rip="${TUN_REMOTE_IP}"
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"; [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+  reqid="$(xfrm_reqid_from_state || true)"; [[ -n "${reqid:-}" ]] || reqid="1"
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
-
-  # add policies for tunnel endpoint IPs (ping will work deterministically)
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
-
-  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
-
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${mark_dec_effective}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 ensure_kernel_modules
 apply_sysctl
 ensure_firewall_rules
-
 if ! wait_for_local_ip; then
   err "Local public IP not present yet: ${LOCAL_WAN_IP} (network not ready)."
   err "Try later: systemctl restart simple-ipsec@${tun}.service"
   exit 1
 fi
-
 ensure_vti
 ensure_tunnel_routes
 ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
-
 sleep 2
-
 if ! wait_for_xfrm_state; then
   err "No XFRM state found after IPsec up. Tunnel is not established."
-  echo
-  warn "ip xfrm state:"
-  ip xfrm state 2>/dev/null || true
-  echo
-  warn "ipsec statusall (top):"
-  timeout 8 ipsec statusall | sed -n '1,140p' || true
+  echo; warn "ip xfrm state:"; ip xfrm state 2>/dev/null || true
+  echo; warn "ipsec statusall (top):"; timeout 8 ipsec statusall | sed -n '1,140p' || true
   exit 1
 fi
-
 xfrm_policy_install_tunnel_ips
 log "Tunnel is up (XFRM state present)."
 
