@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-APP_NAME="Simple IPsec Tunnel"
+APP_NAME="Simple IPsec Tunnel-1.0"
 REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
 APP_DIR="/etc/simple-ipsec"
