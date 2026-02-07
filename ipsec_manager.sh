@@ -728,13 +728,13 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-del-ensure_tunnel_routes() {
+ensure_tunnel_routes() {
   # This function is temporarily disabled for testing.
   # It does nothing and always returns success.
   true
 }
 
-ensure_mangle_mark_rules() {
+del-ensure_mangle_mark_rules() {
   iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
 
