@@ -880,6 +880,8 @@ ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
 
+sleep 2
+
 if ! wait_for_xfrm_state; then
   err "No XFRM state found after IPsec up. Tunnel is not established."
   echo
@@ -1164,6 +1166,10 @@ xfrm_policy_install_tunnel_ips() {
 }
 
 start_ipsec_or_fail() {
+  log "Resetting connection: ${conn_name}..."
+  ipsec down "${conn_name}" >/dev/null 2>&1 || true
+  sleep 1
+
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
 
@@ -1195,7 +1201,12 @@ log "Current tunnel policies:"
 ip xfrm policy 2>/dev/null | egrep -n "$(echo "${TUN_LOCAL_CIDR%%/*}" | sed 's/\./\\./g')|$(echo "${TUN_REMOTE_IP}" | sed 's/\./\\./g')" || true
 
 log "Ping test: ${TUN_REMOTE_IP}"
-ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && log "Ping OK." || warn "Ping failed (check SA counters: ip -s xfrm state)."
+RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; NC="\033[0m"
+if ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+  echo -e "${GRN}[OK]${NC} Ping to ${TUN_REMOTE_IP} is successful."
+else
+  echo -e "${YEL}[WARN]${NC} Ping failed. If SA is up, this might be a firewall issue on the remote peer."
+fi
 
 EOF
 
