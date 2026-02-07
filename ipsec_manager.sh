@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-APP_NAME="Simple IPsec Tunnel-1.0"
+APP_NAME="Simple IPsec Tunnel-1.1"
 REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
 APP_DIR="/etc/simple-ipsec"
@@ -627,7 +627,7 @@ detect_strongswan_unit() {
   echo ""
 }
 
-ensure_strongswan_running_and_healthy() {
+del-ensure_strongswan_running_and_healthy() {
   local unit
   unit="$(detect_strongswan_unit)"
 
@@ -734,7 +734,7 @@ ensure_tunnel_routes() {
   true
 }
 
-del-ensure_mangle_mark_rules() {
+ensure_mangle_mark_rules() {
   iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
 
