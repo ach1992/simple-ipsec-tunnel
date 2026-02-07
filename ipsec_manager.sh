@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-APP_NAME="Simple IPsec Tunnel-1.1"
+APP_NAME="Simple IPsec Tunnel-1.2"
 REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
 APP_DIR="/etc/simple-ipsec"
@@ -627,7 +627,7 @@ detect_strongswan_unit() {
   echo ""
 }
 
-del-ensure_strongswan_running_and_healthy() {
+ensure_strongswan_running_and_healthy() {
   local unit
   unit="$(detect_strongswan_unit)"
 
@@ -732,27 +732,6 @@ ensure_tunnel_routes() {
   # This function is temporarily disabled for testing.
   # It does nothing and always returns success.
   true
-}
-
-ensure_mangle_mark_rules() {
-  iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
-    || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
-
-  iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
-    || iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
-}
-
-xfrm_state_present() {
-  ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"
-}
-
-wait_for_xfrm_state() {
-  local i
-  for i in $(seq 1 "${XFRM_STATE_WAIT}"); do
-    xfrm_state_present && return 0
-    sleep 1
-  done
-  return 1
 }
 
 start_ipsec_or_fail() {
@@ -874,7 +853,6 @@ fi
 
 ensure_vti
 ensure_tunnel_routes
-ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
 
