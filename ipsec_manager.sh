@@ -728,33 +728,20 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-ensure_tunnel_routes() {
+nsure_tunnel_routes() {
   local subnet
   subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
 
   ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
-
-  local mark_dec pref
-  mark_dec="$(mark_to_dec "${MARK}")"
-  pref="${RULE_PREF:-}"
-  [[ -n "${pref:-}" ]] || pref=10000
-
-  ip rule show | grep -qE "pref ${pref} .*fwmark ${mark_dec} .*lookup ${TABLE}" \
-    || ip rule add pref "${pref}" fwmark "${mark_dec}" lookup "${TABLE}" 2>/dev/null || true
-
-  ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link table "${TABLE}" 2>/dev/null || true
-  ip -4 route replace default via "${TUN_REMOTE_IP}" dev "${TUN_NAME}" table "${TABLE}" 2>/dev/null || \
-    ip -4 route add default via "${TUN_REMOTE_IP}" dev "${TUN_NAME}" table "${TABLE}" 2>/dev/null || true
-
-  ip route flush cache >/dev/null 2>/dev/null || true
+  ip route flush cache >/dev/null 2>&1 || true
 }
 
 ensure_mangle_mark_rules() {
+  iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
+
   iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
-
-  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
-    || iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff"
 }
 
 xfrm_state_present() {
@@ -1003,8 +990,8 @@ cleanup_firewall_rules() {
 }
 
 cleanup_iptables_mangle_rules() {
+  iptables -t mangle -D OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
 }
 
 cleanup_xfrm_policies() {
@@ -1029,16 +1016,8 @@ cleanup_xfrm_policies() {
 }
 
 cleanup_policy_routing() {
-  local subnet pref
-  subnet="$(ip -4 route show dev "${TUN_NAME}" | awk '/\/30/{print $1; exit}')"
-  [[ -n "${subnet:-}" ]] || subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
-
-  pref="${RULE_PREF:-}"
-  [[ -n "${pref:-}" ]] || pref=10000
-
-  ip route del default table "${TABLE}" 2>/dev/null || true
-  ip rule del pref "${pref}" 2>/dev/null || true
-  ip route del "${subnet}" table "${TABLE}" 2>/dev/null || true
+  local subnet
+  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
   ip -4 route del "${subnet}" dev "${TUN_NAME}" 2>/dev/null || true
   ip route flush cache >/dev/null 2>&1 || true
 }
