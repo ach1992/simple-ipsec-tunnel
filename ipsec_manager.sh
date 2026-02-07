@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-APP_NAME="Simple IPsec Tunnel-1.2"
+APP_NAME="Simple IPsec Tunnel"
 REPO_URL="https://github.com/ach1992/simple-ipsec-tunnel"
 
 APP_DIR="/etc/simple-ipsec"
@@ -734,6 +734,25 @@ ensure_tunnel_routes() {
   true
 }
 
+ensure_mangle_mark_rules() {
+  # This function is temporarily disabled for testing.
+  # It does nothing and always returns success.
+  true
+}
+
+xfrm_state_present() {
+  ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"
+}
+
+wait_for_xfrm_state() {
+  local i
+  for i in $(seq 1 "${XFRM_STATE_WAIT}"); do
+    xfrm_state_present && return 0
+    sleep 1
+  done
+  return 1
+}
+
 start_ipsec_or_fail() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
@@ -853,6 +872,7 @@ fi
 
 ensure_vti
 ensure_tunnel_routes
+ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
 
