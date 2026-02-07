@@ -444,8 +444,10 @@ conn ${conn_name}
   leftsubnet=0.0.0.0/0
   rightsubnet=0.0.0.0/0
 
-  ike=aes256-sha256-modp2048!
-  esp=aes256-sha256!
+  ## FIX P1: Make crypto proposals more flexible and modern.
+  ## Removed '!' and added modern GCM ciphers first.
+  ike=aes256gcm16-sha256-modp2048,aes256-sha256-modp2048
+  esp=aes256gcm16-sha256,aes256-sha256
 
   dpdaction=restart
   dpddelay=30s
@@ -683,6 +685,32 @@ apply_sysctl() {
   fi
 }
 
+ensure_firewall_rules() {
+    log "Ensuring firewall rules for IPsec..."
+
+    # --- Highest Priority Rule ---
+    # Allow all traffic that is part of an already established connection.
+    # This is a standard best practice for stateful firewalls.
+    iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # --- Rules for establishing NEW connections ---
+    # Allow IKE and NAT-T for new tunnel negotiations.
+    iptables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -p udp --dport 500 -j ACCEPT
+    iptables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p udp --dport 4500 -j ACCEPT
+
+    # Allow ESP protocol for the encrypted data itself.
+    iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p esp -j ACCEPT
+
+    # --- Rules for Forwarding new traffic from the tunnel ---
+    # This allows new connections initiated from the tunnel side to pass through.
+    iptables -C FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 2 -i "${TUN_NAME}" -j ACCEPT
+    iptables -C FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 3 -o "${TUN_NAME}" -j ACCEPT
+}
+
 ensure_vti() {
   local key_dec
   key_dec="$(mark_to_dec "${MARK}")"
@@ -701,14 +729,11 @@ ensure_vti() {
 }
 
 ensure_tunnel_routes() {
-  # route the /30 tunnel subnet via vti, otherwise traffic never goes "out vti"
   local subnet
   subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
 
-  # Main routing table (important!)
   ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
 
-  # Optional: keep your policy-routing table consistent with design
   local mark_dec pref
   mark_dec="$(mark_to_dec "${MARK}")"
   pref="${RULE_PREF:-}"
@@ -718,15 +743,18 @@ ensure_tunnel_routes() {
     || ip rule add pref "${pref}" fwmark "${mark_dec}" lookup "${TABLE}" 2>/dev/null || true
 
   ip -4 route replace "${subnet}" dev "${TUN_NAME}" scope link table "${TABLE}" 2>/dev/null || true
-  ip route flush cache >/dev/null 2>&1 || true
+  ip -4 route replace default via "${TUN_REMOTE_IP}" dev "${TUN_NAME}" table "${TABLE}" 2>/dev/null || \
+    ip -4 route add default via "${TUN_REMOTE_IP}" dev "${TUN_NAME}" table "${TABLE}" 2>/dev/null || true
+
+  ip route flush cache >/dev/null 2>/dev/null || true
 }
 
 ensure_mangle_mark_rules() {
-  iptables -t mangle -C OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
-    || iptables -t mangle -A OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
-
   iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
     || iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
+
+  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff"
 }
 
 xfrm_state_present() {
@@ -851,6 +879,7 @@ xfrm_policy_install_tunnel_ips() {
 
 ensure_kernel_modules
 apply_sysctl
+ensure_firewall_rules
 
 if ! wait_for_local_ip; then
   err "Local public IP not present yet: ${LOCAL_WAN_IP} (network not ready)."
@@ -932,10 +961,50 @@ xfrm_state_mark_dec() {
   fi
 }
 
+cleanup_firewall_rules() {
+    # Check if any other VTI interface managed by this script exists.
+    local other_vti_exists=false
+    # Use a subshell to avoid modifying the main script's IFS or other settings
+    (
+        shopt -s nullglob
+        local conf_files=("$TUNNELS_DIR"/*.conf)
+        for conf_file in "${conf_files[@]}"; do
+            local other_tun_name
+            other_tun_name=$(basename "$conf_file" .conf)
+            # If the tunnel is not the one we are currently deleting AND its interface exists...
+            if [[ "$other_tun_name" != "$tun" ]] && ip link show "$other_tun_name" >/dev/null 2>&1; then
+                other_vti_exists=true
+                break
+            fi
+        done
+        # Exit subshell and return status via a variable that the parent can see
+        # This is a bit tricky in shell, a simple echo is easier.
+    )
+    
+    # A simpler way to check for other tunnels without complex subshells
+    local other_tunnel_count
+    other_tunnel_count=$(find "$TUNNELS_DIR" -maxdepth 1 -name "*.conf" -not -name "${tun}.conf" | wc -l)
+
+
+    # If no other tunnels are configured, we can safely remove the generic firewall rules.
+    if [[ "$other_tunnel_count" -eq 0 ]]; then
+        # Remove rules in reverse order of insertion for safety
+        # These rules are generic and should only be removed if this is the last tunnel.
+        iptables -D INPUT -p esp -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    fi
+
+    # Always remove rules specific to this tunnel's interface, regardless of other tunnels.
+    iptables -D FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || true
+}
+
 cleanup_iptables_mangle_rules() {
-  # remove both rules if exist (idempotent)
-  iptables -t mangle -D OUTPUT -o "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
 }
 
 cleanup_xfrm_policies() {
@@ -967,6 +1036,7 @@ cleanup_policy_routing() {
   pref="${RULE_PREF:-}"
   [[ -n "${pref:-}" ]] || pref=10000
 
+  ip route del default table "${TABLE}" 2>/dev/null || true
   ip rule del pref "${pref}" 2>/dev/null || true
   ip route del "${subnet}" table "${TABLE}" 2>/dev/null || true
   ip -4 route del "${subnet}" dev "${TUN_NAME}" 2>/dev/null || true
@@ -975,6 +1045,7 @@ cleanup_policy_routing() {
 
 ipsec down "${conn_name}" >/dev/null 2>&1 || true
 
+cleanup_firewall_rules
 cleanup_xfrm_policies
 cleanup_policy_routing
 cleanup_iptables_mangle_rules
