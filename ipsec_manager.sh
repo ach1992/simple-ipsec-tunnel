@@ -728,7 +728,7 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-ensure_tunnel_routes() {
+del-ensure_tunnel_routes() {
   # This function is temporarily disabled for testing.
   # It does nothing and always returns success.
   true
@@ -825,6 +825,43 @@ xfrm_reqid_from_state() {
   echo "$reqid"
 }
 
+xfrm_policy_install_tunnel_ips() {
+  local lip rip reqid mark_dec_effective
+  lip="$(local_tun_ip)"
+  rip="${TUN_REMOTE_IP}"
+
+  # prefer REAL mark from xfrm state (fall back to config mark)
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+
+  reqid="$(xfrm_reqid_from_state || true)"
+  [[ -n "${reqid:-}" ]] || reqid="1"
+
+  # best-effort delete old policies (with and without mark)
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
+
+  # add policies for tunnel endpoint IPs (ping will work deterministically)
+  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+}
+
 ensure_kernel_modules
 apply_sysctl
 ensure_firewall_rules
@@ -852,6 +889,7 @@ if ! wait_for_xfrm_state; then
   exit 1
 fi
 
+xfrm_policy_install_tunnel_ips
 log "Tunnel is up (XFRM state present)."
 
 EOF
