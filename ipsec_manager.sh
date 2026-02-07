@@ -728,7 +728,7 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-nsure_tunnel_routes() {
+ensure_tunnel_routes() {
   local subnet
   subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
 
