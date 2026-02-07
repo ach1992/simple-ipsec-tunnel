@@ -728,7 +728,7 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-ensure_tunnel_routes() {
+del-ensure_tunnel_routes() {
   # This function is temporarily disabled for testing.
   # It does nothing and always returns success.
   true
@@ -877,8 +877,6 @@ ensure_tunnel_routes
 ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
-
-	   
 
 if ! wait_for_xfrm_state; then
   err "No XFRM state found after IPsec up. Tunnel is not established."
@@ -1164,10 +1162,6 @@ xfrm_policy_install_tunnel_ips() {
 }
 
 start_ipsec_or_fail() {
-											 
-												   
-		 
-
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
 
@@ -1199,12 +1193,7 @@ log "Current tunnel policies:"
 ip xfrm policy 2>/dev/null | egrep -n "$(echo "${TUN_LOCAL_CIDR%%/*}" | sed 's/\./\\./g')|$(echo "${TUN_REMOTE_IP}" | sed 's/\./\\./g')" || true
 
 log "Ping test: ${TUN_REMOTE_IP}"
-																  
 ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && log "Ping OK." || warn "Ping failed (check SA counters: ip -s xfrm state)."
-																   
-	
-																										  
-  
 
 EOF
 
