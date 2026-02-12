@@ -4,7 +4,6 @@ set -Eeuo pipefail
 # ============================================================
 #  Simple IPsec Tunnel (IKEv2 + VTI) - Multi Tunnel Manager
 #  Optimized for Debian/Ubuntu (multiple versions)
-#  Fixed for: Auto-restart, Rekey stability, Abuse Defender compatibility
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
