@@ -27,7 +27,7 @@ FIX_HELPER="/usr/local/sbin/simple-ipsec-fix"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1436"
+MTU_DEFAULT="1381"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
