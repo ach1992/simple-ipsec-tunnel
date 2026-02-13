@@ -22,17 +22,6 @@ SECRETS_FILE="/etc/ipsec.d/simple-ipsec.secrets"
 SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec@.service"
 UP_HELPER="/usr/local/sbin/simple-ipsec-up"
 DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
-FIX_HELPER="/usr/local/sbin/simple-ipsec-fix"
-FW_HELPER="/usr/local/sbin/simple-ipsec-firewall"
-HEALTH_HELPER="/usr/local/sbin/simple-ipsec-health"
-
-# timers/services for auto-heal
-HEALTH_SERVICE="/etc/systemd/system/simple-ipsec-health.service"
-HEALTH_TIMER="/etc/systemd/system/simple-ipsec-health.timer"
-
-# Firewall chain names (short + safe)
-FW_GLOBAL_CHAIN="SIMPLE_IPSEC"
-FW_HOOK_COMMENT="simple-ipsec-hook"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
@@ -45,13 +34,10 @@ DISABLE_RPFILTER_DEFAULT="yes"
 ENABLE_SRC_VALID_MARK_DEFAULT="yes"
 ENABLE_DISABLE_POLICY_DEFAULT="no"   # risky globally; per-iface only
 
-# Timeouts
+# Timeouts (slow/unstable networks may need more time)
 SYSTEMCTL_RESTART_TIMEOUT="${SYSTEMCTL_RESTART_TIMEOUT:-180}"   # seconds
 IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"                     # seconds
 XFRM_WAIT_MAX="${XFRM_WAIT_MAX:-90}"                           # seconds
-
-# Health loop (auto-heal interval)
-HEALTH_INTERVAL_SEC="${HEALTH_INTERVAL_SEC:-60}"
 
 # Colors
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
@@ -90,11 +76,7 @@ require_cmds() {
     have_cmd "$c" || missing+=("$c")
   done
   have_cmd ipsec || missing+=("strongswan (ipsec)")
-  # iptables variants optional; we'll detect at runtime; but at least one should exist
-  if ! (have_cmd iptables || have_cmd iptables-legacy || have_cmd iptables-nft); then
-    missing+=("iptables (or iptables-legacy/iptables-nft)")
-  fi
-
+  have_cmd iptables || missing+=("iptables")
   if ((${#missing[@]})); then
     err "Missing required commands: ${missing[*]}"
     err "Debian/Ubuntu install:"
@@ -111,6 +93,8 @@ ensure_dirs() {
 }
 
 ensure_strongswan_service_running() {
+  # On some images strongSwan is installed but the daemon is not started/enabled yet.
+  # If charon/starter is down, "ipsec up" will fail and the tunnel will never come up.
   if ! have_cmd systemctl; then
     return 0
   fi
@@ -336,9 +320,11 @@ prompt_paste_copy_block() {
     if [[ -z "${line:-}" ]]; then
       empty_count=$((empty_count+1))
       if (( empty_count == 1 )); then
+        # requested UX: show message after first Enter
         echo -e "${MAG}Please press Enter one more time to finish.${NC}"
         continue
       fi
+      # second empty line => finish silently (no "Paste finished..." message)
       break
     fi
     empty_count=0
@@ -452,11 +438,11 @@ conn ${conn_name}
   leftsubnet=0.0.0.0/0
   rightsubnet=0.0.0.0/0
 
-  # proposals (flexible + modern)
+  ## FIX P1: Make crypto proposals more flexible and modern.
+  ## Removed '!' and added modern GCM ciphers first.
   ike=aes256gcm16-sha256-modp2048,aes256-sha256-modp2048
   esp=aes256gcm16-sha256,aes256-sha256
 
-  # keepalive / stability
   dpdaction=restart
   dpddelay=30s
   keyingtries=%forever
@@ -543,189 +529,19 @@ write_sysctl_persist() {
 
   chmod 644 "$SYSCTL_FILE" || true
 
+  # Make sysctl persistent in the standard sysctl.d path too.
+  # This avoids "works until reboot" issues.
   local sysctl_d="/etc/sysctl.d/99-simple-ipsec.conf"
   ln -sf "$SYSCTL_FILE" "$sysctl_d" >/dev/null 2>&1 || true
 
+  # Apply immediately (explicitly load our file; sysctl --system ignores /etc/simple-ipsec/ by default)
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 }
 
 # -----------------------
-# Firewall: apply to iptables + iptables-legacy + iptables-nft
-# -----------------------
-detect_iptables_bins() {
-  local bins=()
-  have_cmd iptables && bins+=("iptables")
-  have_cmd iptables-legacy && bins+=("iptables-legacy")
-  have_cmd iptables-nft && bins+=("iptables-nft")
-
-  # de-dup by path
-  local uniq=() seen=""
-  local b p
-  for b in "${bins[@]}"; do
-    p="$(command -v "$b" 2>/dev/null || true)"
-    [[ -n "$p" ]] || continue
-    if [[ "$seen" != *"|$p|"* ]]; then
-      seen="${seen}|$p|"
-      uniq+=("$b")
-    fi
-  done
-  echo "${uniq[*]:-}"
-}
-
-fw_chain_for_tun() {
-  # short and safe. if tun name too long, truncate.
-  local t="$1"
-  local base="SIP_${t}"
-  if ((${#base} > 28)); then
-    base="${base:0:28}"
-  fi
-  echo "$base"
-}
-
-fw_run_all() {
-  local args=("$@")
-  local bins; bins="$(detect_iptables_bins)"
-  local b
-  for b in $bins; do
-    "$b" "${args[@]}" 2>/dev/null || true
-  done
-}
-
-fw_check_any() {
-  local args=("$@")
-  local bins; bins="$(detect_iptables_bins)"
-  local b
-  for b in $bins; do
-    if "$b" "${args[@]}" >/dev/null 2>&1; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-fw_ensure_chain() {
-  local chain="$1"
-  fw_check_any -t filter -S "$chain" >/dev/null 2>&1 && return 0
-  fw_run_all -t filter -N "$chain"
-}
-
-fw_flush_chain() { fw_run_all -t filter -F "$1"; }
-
-fw_delete_chain() {
-  local chain="$1"
-  fw_run_all -t filter -F "$chain"
-  fw_run_all -t filter -X "$chain"
-}
-
-fw_ensure_hook() {
-  local base_chain="$1"   # FW_GLOBAL_CHAIN
-  local hook_chain="$2"   # INPUT/OUTPUT/FORWARD
-
-  # Insert at very top for highest priority
-  if ! fw_check_any -t filter -C "$hook_chain" -j "$base_chain"; then
-    fw_run_all -t filter -I "$hook_chain" 1 -j "$base_chain"
-  fi
-}
-
-fw_remove_hook_all() {
-  local base_chain="$1"
-  local hook_chain="$2"
-  # delete all occurrences
-  while fw_check_any -t filter -C "$hook_chain" -j "$base_chain"; do
-    fw_run_all -t filter -D "$hook_chain" -j "$base_chain"
-  done
-}
-
-fw_add_rule_once() {
-  # usage: fw_add_rule_once <chain> <rule...>
-  local chain="$1"; shift
-  if ! fw_check_any -t filter -C "$chain" "$@"; then
-    fw_run_all -t filter -A "$chain" "$@"
-  fi
-}
-
-fw_del_rule_all() {
-  # usage: fw_del_rule_all <chain> <rule...>
-  local chain="$1"; shift
-  while fw_check_any -t filter -C "$chain" "$@"; do
-    fw_run_all -t filter -D "$chain" "$@"
-  done
-}
-
-fw_global_ensure() {
-  fw_ensure_chain "$FW_GLOBAL_CHAIN"
-
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" INPUT
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" OUTPUT
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" FORWARD
-
-  # best practice: established first
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-  # allow IKE/NAT-T/ESP (both directions; safe even if not used)
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --dport 500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --dport 4500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p esp -j ACCEPT
-
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --sport 500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --sport 4500 -j ACCEPT
-
-  # return to caller chain
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -j RETURN
-}
-
-fw_tunnel_ensure() {
-  local tun="$1"
-  local ifc="$2"
-  local lip="$3"  # local tunnel ip (no /30)
-  local rip="$4"  # remote tunnel ip
-
-  local tchain; tchain="$(fw_chain_for_tun "$tun")"
-  fw_ensure_chain "$tchain"
-  fw_flush_chain "$tchain"
-
-  # Accept ICMP between tunnel endpoints (helps status ping)
-  fw_add_rule_once "$tchain" -p icmp -s "$lip" -d "$rip" -j ACCEPT
-  fw_add_rule_once "$tchain" -p icmp -s "$rip" -d "$lip" -j ACCEPT
-
-  # Allow forwarding via VTI interface (tunnel data plane)
-  fw_add_rule_once "$tchain" -i "$ifc" -j ACCEPT
-  fw_add_rule_once "$tchain" -o "$ifc" -j ACCEPT
-
-  fw_add_rule_once "$tchain" -j RETURN
-
-  # Ensure global chain jumps into per-tunnel chain (before RETURN)
-  # Insert jump as first rule in FW_GLOBAL_CHAIN so per-tunnel rules are checked early.
-  if ! fw_check_any -t filter -C "$FW_GLOBAL_CHAIN" -j "$tchain"; then
-    fw_run_all -t filter -I "$FW_GLOBAL_CHAIN" 1 -j "$tchain"
-  fi
-}
-
-fw_tunnel_remove() {
-  local tun="$1"
-  local tchain; tchain="$(fw_chain_for_tun "$tun")"
-
-  fw_del_rule_all "$FW_GLOBAL_CHAIN" -j "$tchain"
-  fw_delete_chain "$tchain"
-}
-
-fw_maybe_remove_global_if_last() {
-  # remove global if no tunnels remain
-  local count
-  count="$(find "$TUNNELS_DIR" -maxdepth 1 -name "*.conf" 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${count:-0}" -eq 0 ]]; then
-    fw_remove_hook_all "$FW_GLOBAL_CHAIN" INPUT
-    fw_remove_hook_all "$FW_GLOBAL_CHAIN" OUTPUT
-    fw_remove_hook_all "$FW_GLOBAL_CHAIN" FORWARD
-    fw_delete_chain "$FW_GLOBAL_CHAIN"
-  fi
-}
-
-# -----------------------
-# systemd template + helpers + firewall + health
+# systemd template + helpers
 # -----------------------
 ensure_systemd_template() {
-  # Per-tunnel service: oneshot, BUT retries on failure (fix #1)
   cat >"$SERVICE_TEMPLATE" <<'EOF'
 [Unit]
 Description=Simple IPsec Tunnel - IPsec VTI (%i)
@@ -736,13 +552,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 
-TimeoutStartSec=60
+TimeoutStartSec=45
 TimeoutStopSec=30
-
-# Fix #1: if peer isn't up yet, retry automatically
-Restart=on-failure
-RestartSec=10
-StartLimitIntervalSec=0
 
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
@@ -751,250 +562,21 @@ ExecStop=/usr/local/sbin/simple-ipsec-down %i
 WantedBy=multi-user.target
 EOF
 
-  # Firewall helper (ensure rules for all tunnels; supports legacy+nft)
-  cat >"$FW_HELPER" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-APP_DIR="/etc/simple-ipsec"
-TUNNELS_DIR="$APP_DIR/tunnels.d"
-
-FW_GLOBAL_CHAIN="SIMPLE_IPSEC"
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-detect_iptables_bins() {
-  local bins=()
-  have_cmd iptables && bins+=("iptables")
-  have_cmd iptables-legacy && bins+=("iptables-legacy")
-  have_cmd iptables-nft && bins+=("iptables-nft")
-
-  local uniq=() seen=""
-  local b p
-  for b in "${bins[@]}"; do
-    p="$(command -v "$b" 2>/dev/null || true)"
-    [[ -n "$p" ]] || continue
-    if [[ "$seen" != *"|$p|"* ]]; then
-      seen="${seen}|$p|"
-      uniq+=("$b")
-    fi
-  done
-  echo "${uniq[*]:-}"
-}
-
-fw_chain_for_tun() {
-  local t="$1"
-  local base="SIP_${t}"
-  if ((${#base} > 28)); then base="${base:0:28}"; fi
-  echo "$base"
-}
-
-fw_run_all() {
-  local args=("$@")
-  local bins; bins="$(detect_iptables_bins)"
-  local b
-  for b in $bins; do
-    "$b" "${args[@]}" 2>/dev/null || true
-  done
-}
-
-fw_check_any() {
-  local args=("$@")
-  local bins; bins="$(detect_iptables_bins)"
-  local b
-  for b in $bins; do
-    if "$b" "${args[@]}" >/dev/null 2>&1; then return 0; fi
-  done
-  return 1
-}
-
-fw_ensure_chain() {
-  local chain="$1"
-  fw_check_any -t filter -S "$chain" >/dev/null 2>&1 && return 0
-  fw_run_all -t filter -N "$chain"
-}
-
-fw_flush_chain() { fw_run_all -t filter -F "$1"; }
-
-fw_delete_chain() {
-  local chain="$1"
-  fw_run_all -t filter -F "$chain"
-  fw_run_all -t filter -X "$chain"
-}
-
-fw_ensure_hook() {
-  local base_chain="$1"
-  local hook_chain="$2"
-  if ! fw_check_any -t filter -C "$hook_chain" -j "$base_chain"; then
-    fw_run_all -t filter -I "$hook_chain" 1 -j "$base_chain"
-  fi
-}
-
-fw_add_rule_once() {
-  local chain="$1"; shift
-  if ! fw_check_any -t filter -C "$chain" "$@"; then
-    fw_run_all -t filter -A "$chain" "$@"
-  fi
-}
-
-fw_del_rule_all() {
-  local chain="$1"; shift
-  while fw_check_any -t filter -C "$chain" "$@"; do
-    fw_run_all -t filter -D "$chain" "$@"
-  done
-}
-
-fw_global_ensure() {
-  fw_ensure_chain "$FW_GLOBAL_CHAIN"
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" INPUT
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" OUTPUT
-  fw_ensure_hook "$FW_GLOBAL_CHAIN" FORWARD
-
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --dport 500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --dport 4500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p esp -j ACCEPT
-
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --sport 500 -j ACCEPT
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -p udp --sport 4500 -j ACCEPT
-
-  fw_add_rule_once "$FW_GLOBAL_CHAIN" -j RETURN
-}
-
-fw_tunnel_ensure() {
-  local tun="$1"
-  local ifc="$2"
-  local lip="$3"
-  local rip="$4"
-  local tchain; tchain="$(fw_chain_for_tun "$tun")"
-
-  fw_ensure_chain "$tchain"
-  fw_flush_chain "$tchain"
-
-  fw_add_rule_once "$tchain" -p icmp -s "$lip" -d "$rip" -j ACCEPT
-  fw_add_rule_once "$tchain" -p icmp -s "$rip" -d "$lip" -j ACCEPT
-  fw_add_rule_once "$tchain" -i "$ifc" -j ACCEPT
-  fw_add_rule_once "$tchain" -o "$ifc" -j ACCEPT
-  fw_add_rule_once "$tchain" -j RETURN
-
-  if ! fw_check_any -t filter -C "$FW_GLOBAL_CHAIN" -j "$tchain"; then
-    fw_run_all -t filter -I "$FW_GLOBAL_CHAIN" 1 -j "$tchain"
-  fi
-}
-
-fw_tunnel_remove() {
-  local tun="$1"
-  local tchain; tchain="$(fw_chain_for_tun "$tun")"
-  fw_del_rule_all "$FW_GLOBAL_CHAIN" -j "$tchain"
-  fw_delete_chain "$tchain"
-}
-
-fw_maybe_remove_global_if_last() {
-  local count
-  count="$(find "$TUNNELS_DIR" -maxdepth 1 -name "*.conf" 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${count:-0}" -eq 0 ]]; then
-    fw_del_rule_all INPUT -j "$FW_GLOBAL_CHAIN"
-    fw_del_rule_all OUTPUT -j "$FW_GLOBAL_CHAIN"
-    fw_del_rule_all FORWARD -j "$FW_GLOBAL_CHAIN"
-    fw_delete_chain "$FW_GLOBAL_CHAIN"
-  fi
-}
-
-action="${1:-reconcile}"
-
-fw_global_ensure
-
-shopt -s nullglob
-for f in "$TUNNELS_DIR"/*.conf; do
-  # shellcheck disable=SC1090
-  source "$f"
-  tun="$(basename "$f" .conf)"
-  ifc="${TUN_NAME:-$tun}"
-  lip="${TUN_LOCAL_CIDR%%/*}"
-  rip="${TUN_REMOTE_IP}"
-  fw_tunnel_ensure "$tun" "$ifc" "$lip" "$rip"
-done
-shopt -u nullglob
-
-if [[ "$action" == "cleanup-if-last" ]]; then
-  fw_maybe_remove_global_if_last
-fi
-EOF
-
-  # Health helper: auto-heal firewall + XFRM ping policies (fix #2/#4/#5)
-  cat >"$HEALTH_HELPER" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-APP_DIR="/etc/simple-ipsec"
-TUNNELS_DIR="$APP_DIR/tunnels.d"
-
-mark_to_dec() {
-  local m="$1"
-  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
-}
-local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
-
-xfrm_state_present_pair() {
-  ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"
-}
-
-xfrm_policy_install_tunnel_ips_no_reqid() {
-  local lip rip mark_dec
-  lip="$(local_tun_ip)"
-  rip="${TUN_REMOTE_IP}"
-  mark_dec="$(mark_to_dec "${MARK}")"
-
-  # delete old policies (with and without mark)
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
-
-  # add policies WITHOUT reqid (survives rekey)
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
-
-  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
-
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
-}
-
-# 1) firewall reconcile (legacy+nft+iptables)
-if [[ -x /usr/local/sbin/simple-ipsec-firewall ]]; then
-  /usr/local/sbin/simple-ipsec-firewall reconcile >/dev/null 2>&1 || true
-fi
-
-# 2) xfrm policy heal for every tunnel that has an SA (rekey-safe)
-shopt -s nullglob
-for f in "$TUNNELS_DIR"/*.conf; do
-  # shellcheck disable=SC1090
-  source "$f"
-  if xfrm_state_present_pair; then
-    xfrm_policy_install_tunnel_ips_no_reqid
-  fi
-done
-shopt -u nullglob
-EOF
-
+  # -----------------------
   # UP helper
+  # -----------------------
   cat >"$UP_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-20}"          # seconds per try
-IPSEC_UP_TRIES="${IPSEC_UP_TRIES:-3}"              # retries
-WAIT_LOCAL_IP_MAX="${WAIT_LOCAL_IP_MAX:-20}"        # seconds
-XFRM_STATE_WAIT="${XFRM_STATE_WAIT:-10}"            # seconds
+# Fast + deterministic startup:
+# - Fail fast if IPsec can't come up (so systemd shows FAILED instead of "active (exited)")
+# - Only install XFRM ping policies AFTER a real XFRM state exists
+# - Print useful diagnostics to journal on failure
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-12}"          # seconds per try
+IPSEC_UP_TRIES="${IPSEC_UP_TRIES:-2}"              # retries
+WAIT_LOCAL_IP_MAX="${WAIT_LOCAL_IP_MAX:-15}"        # seconds
+XFRM_STATE_WAIT="${XFRM_STATE_WAIT:-6}"             # seconds
 
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
@@ -1014,7 +596,11 @@ log()  { echo "[simple-ipsec-up:${tun}] $*"; }
 warn() { echo "[simple-ipsec-up:${tun}][WARN] $*" >&2; }
 err()  { echo "[simple-ipsec-up:${tun}][ERROR] $*" >&2; }
 
-mark_to_dec() { if [[ "$1" =~ ^0x ]]; then echo $((16#${1#0x})); else echo "$1"; fi; }
+mark_to_dec() {
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
+
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 ensure_kernel_modules() {
@@ -1023,22 +609,39 @@ ensure_kernel_modules() {
 }
 
 detect_strongswan_unit() {
+  # Return unit name if exists, else empty
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl cat strongswan-starter.service >/dev/null 2>&1; then echo "strongswan-starter.service"; return 0; fi
-    if systemctl cat strongswan.service >/dev/null 2>&1; then echo "strongswan.service"; return 0; fi
+    if systemctl cat strongswan-starter.service >/dev/null 2>&1; then
+      echo "strongswan-starter.service"; return 0
+    fi
+    if systemctl cat strongswan.service >/dev/null 2>&1; then
+      echo "strongswan.service"; return 0
+    fi
   fi
   echo ""
 }
 
 ensure_strongswan_running_and_healthy() {
-  local unit; unit="$(detect_strongswan_unit)"
-  [[ -n "$unit" ]] && systemctl start "$unit" >/dev/null 2>&1 || true
+  local unit
+  unit="$(detect_strongswan_unit)"
 
-  if ! timeout 6 ipsec statusall >/dev/null 2>&1; then
+  if [[ -n "$unit" ]]; then
+    systemctl start "$unit" >/dev/null 2>&1 || true
+  fi
+
+  # Verify daemon health via ipsec statusall (works across 5.x/6.x)
+  if ! timeout 5 ipsec statusall >/dev/null 2>&1; then
     err "strongSwan seems not healthy (ipsec statusall failed)."
     if [[ -n "$unit" ]]; then
       warn "systemd status: $unit"
       systemctl --no-pager --full status "$unit" || true
+      if command -v journalctl >/dev/null 2>&1; then
+        echo
+        warn "Recent strongSwan logs:"
+        journalctl -u "$unit" -n 120 --no-pager || true
+      fi
+    else
+      warn "Could not detect strongSwan systemd unit (strongswan-starter/strongswan)."
     fi
     exit 1
   fi
@@ -1056,6 +659,7 @@ wait_for_local_ip() {
 }
 
 apply_sysctl() {
+  # Load our file explicitly (sysctl --system ignores /etc/simple-ipsec by default)
   [[ -f "$SYSCTL_FILE" ]] && sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 
   [[ "${ENABLE_FORWARDING:-no}" == "yes" ]] && sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -1075,16 +679,12 @@ apply_sysctl() {
   fi
 }
 
-ensure_firewall_rules() {
-  # Ensure global+per-tunnel firewall across iptables/legacy/nft (fix #4/#5)
-  if [[ -x /usr/local/sbin/simple-ipsec-firewall ]]; then
-    /usr/local/sbin/simple-ipsec-firewall reconcile >/dev/null 2>&1 || true
-  fi
-}
 
 ensure_vti() {
-  local key_dec; key_dec="$(mark_to_dec "${MARK}")"
+  local key_dec
+  key_dec="$(mark_to_dec "${MARK}")"
 
+  # Recreate every time to avoid stale endpoints/keys after edits
   if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
     ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
     ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
@@ -1097,14 +697,22 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-xfrm_state_present_pair() {
+ensure_tunnel_routes() {
+  true
+}
+
+ensure_mangle_mark_rules() {
+  true
+}
+
+xfrm_state_present() {
   ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"
 }
 
 wait_for_xfrm_state() {
   local i
   for i in $(seq 1 "${XFRM_STATE_WAIT}"); do
-    xfrm_state_present_pair && return 0
+    xfrm_state_present && return 0
     sleep 1
   done
   return 1
@@ -1125,67 +733,132 @@ start_ipsec_or_fail() {
   done
 
   err "IPsec did not come up."
+  echo
+  warn "ipsec statusall (top):"
   timeout 8 ipsec statusall | sed -n '1,140p' || true
   exit 1
 }
 
-xfrm_policy_install_tunnel_ips_no_reqid() {
-  # Fix #2: do NOT pin to reqid (survives rekey)
-  local lip rip mark_dec
+xfrm_state_mark_dec() {
+  # Try both directions; return decimal mark or empty
+  local m=""
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="mark" {print $2; exit}
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${m:-}" ]]; then
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="mark" {print $2; exit}
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${m:-}" ]] || return 0
+  m="${m%%/*}"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
+
+xfrm_reqid_from_state() {
+  # Return numeric reqid from a matching ESP state (either direction)
+  local reqid=""
+  reqid="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="proto" && $2=="esp" {
+        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+      }
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${reqid:-}" ]]; then
+    reqid="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="proto" && $2=="esp" {
+          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+        }
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  reqid="${reqid%%(*}"
+  reqid="${reqid//[^0-9]/}"
+  [[ -n "${reqid:-}" ]] || return 0
+  echo "$reqid"
+}
+
+xfrm_policy_install_tunnel_ips() {
+  local lip rip reqid mark_dec_effective
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
-  mark_dec="$(mark_to_dec "${MARK}")"
 
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
+  # prefer REAL mark from xfrm state (fall back to config mark)
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+
+  reqid="$(xfrm_reqid_from_state || true)"
+  [[ -n "${reqid:-}" ]] || reqid="1"
+
+  # best-effort delete old policies (with and without mark)
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 
+  # add policies for tunnel endpoint IPs (ping will work deterministically)
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 ensure_kernel_modules
 apply_sysctl
-ensure_firewall_rules
 
 if ! wait_for_local_ip; then
   err "Local public IP not present yet: ${LOCAL_WAN_IP} (network not ready)."
+  err "Try later: systemctl restart simple-ipsec@${tun}.service"
   exit 1
 fi
 
 ensure_vti
+ensure_tunnel_routes
+ensure_mangle_mark_rules
 ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
 
 if ! wait_for_xfrm_state; then
   err "No XFRM state found after IPsec up. Tunnel is not established."
+  echo
+  warn "ip xfrm state:"
   ip xfrm state 2>/dev/null || true
+  echo
+  warn "ipsec statusall (top):"
+  timeout 8 ipsec statusall | sed -n '1,140p' || true
   exit 1
 fi
 
-xfrm_policy_install_tunnel_ips_no_reqid
-
-# also kick health once (fast auto-heal)
-if [[ -x /usr/local/sbin/simple-ipsec-health ]]; then
-  /usr/local/sbin/simple-ipsec-health >/dev/null 2>&1 || true
-fi
-
+xfrm_policy_install_tunnel_ips
 log "Tunnel is up (XFRM state present)."
+
 EOF
 
+  # -----------------------
   # DOWN helper
+  # -----------------------
   cat >"$DOWN_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -1203,42 +876,89 @@ source "$CONF_FILE"
 
 conn_name="simple-ipsec-${tun}"
 
-mark_to_dec() { if [[ "$1" =~ ^0x ]]; then echo $((16#${1#0x})); else echo "$1"; fi; }
+mark_to_dec() {
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
+xfrm_state_mark_dec() {
+  # Try both directions; return decimal mark or empty
+  local m=""
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="mark" {print $2; exit}
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${m:-}" ]]; then
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="mark" {print $2; exit}
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${m:-}" ]] || return 0
+  m="${m%%/*}"   # strip /0xffffffff
+  if [[ "$m" =~ ^0x ]]; then
+    echo $((16#${m#0x}))
+  else
+    echo "$m"
+  fi
+}
+
+
+
 cleanup_xfrm_policies() {
-  local lip rip mark_dec
+  local lip rip mark_dec_effective
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
-  mark_dec="$(mark_to_dec "${MARK}")"
 
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
+  # prefer REAL mark from xfrm state (fall back to config mark)
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+
+  # best-effort delete old policies (with and without mark) to avoid "File exists"
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 }
 
+cleanup_policy_routing() {
+  local subnet
+  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
+  ip -4 route del "${subnet}" dev "${TUN_NAME}" 2>/dev/null || true
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
 ipsec down "${conn_name}" >/dev/null 2>&1 || true
 
 cleanup_xfrm_policies
-
-# remove firewall per-tunnel chain (and global if last)
-if [[ -x /usr/local/sbin/simple-ipsec-firewall ]]; then
-  # best-effort remove this tunnel's chain by calling "reconcile" (it rebuilds from existing confs)
-  # actual removal is done by main script on delete; here we just reconcile.
-  /usr/local/sbin/simple-ipsec-firewall reconcile >/dev/null 2>&1 || true
-fi
+cleanup_policy_routing
 
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
 EOF
 
-  # FIX helper (manual) - now reqid-free too
+
+  # -----------------------
+  # FIX helper (force XFRM policy repair)
+  # -----------------------
+  FIX_HELPER="/usr/local/sbin/simple-ipsec-fix"
   cat >"$FIX_HELPER" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-12}"
+IPSEC_UP_TRIES="${IPSEC_UP_TRIES:-2}"
+XFRM_STATE_WAIT="${XFRM_STATE_WAIT:-6}"
 
 APP_DIR="/etc/simple-ipsec"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
@@ -1255,106 +975,164 @@ conn_name="simple-ipsec-${tun}"
 
 log()  { echo "[simple-ipsec-fix:${tun}] $*"; }
 warn() { echo "[simple-ipsec-fix:${tun}][WARN] $*" >&2; }
+err()  { echo "[simple-ipsec-fix:${tun}][ERROR] $*" >&2; }
 
-mark_to_dec() { if [[ "$1" =~ ^0x ]]; then echo $((16#${1#0x})); else echo "$1"; fi; }
+mark_to_dec() {
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
-xfrm_state_present_pair() {
+xfrm_state_present() {
   ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"
 }
 
-xfrm_policy_install_tunnel_ips_no_reqid() {
-  local lip rip mark_dec
+wait_for_xfrm_state() {
+  local i
+  for i in $(seq 1 "${XFRM_STATE_WAIT}"); do
+    xfrm_state_present && return 0
+    sleep 1
+  done
+  return 1
+}
+
+xfrm_state_mark_dec() {
+  local m=""
+  m="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="mark" {print $2; exit}
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${m:-}" ]]; then
+    m="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="mark" {print $2; exit}
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  [[ -n "${m:-}" ]] || return 0
+  m="${m%%/*}"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
+}
+
+xfrm_reqid_from_state() {
+  local reqid=""
+  reqid="$(ip xfrm state 2>/dev/null | awk -v s="${LOCAL_WAN_IP}" -v d="${REMOTE_WAN_IP}" '
+      $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+      inblk && $1=="proto" && $2=="esp" {
+        for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+      }
+      inblk && /^$/ {inblk=0}
+    ' | head -n1
+  )"
+  if [[ -z "${reqid:-}" ]]; then
+    reqid="$(ip xfrm state 2>/dev/null | awk -v s="${REMOTE_WAN_IP}" -v d="${LOCAL_WAN_IP}" '
+        $1=="src" && $2==s && $3=="dst" && $4==d {inblk=1}
+        inblk && $1=="proto" && $2=="esp" {
+          for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
+        }
+        inblk && /^$/ {inblk=0}
+      ' | head -n1
+    )"
+  fi
+  reqid="${reqid%%(*}"
+  reqid="${reqid//[^0-9]/}"
+  [[ -n "${reqid:-}" ]] || return 0
+  echo "$reqid"
+}
+
+xfrm_policy_install_tunnel_ips() {
+  local lip rip reqid mark_dec_effective
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
-  mark_dec="$(mark_to_dec "${MARK}")"
 
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec}" mask 0xffffffff 2>/dev/null || true
+  mark_dec_effective="$(xfrm_state_mark_dec || true)"
+  [[ -n "${mark_dec_effective:-}" ]] || mark_dec_effective="$(mark_to_dec "${MARK}")"
+
+  reqid="$(xfrm_reqid_from_state || true)"
+  [[ -n "${reqid:-}" ]] || reqid="1"
+
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${mark_dec}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp mode tunnel 2>/dev/null || true
+    mark "${mark_dec_effective}" mask 0xffffffff \
+    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
-ipsec rereadsecrets >/dev/null 2>&1 || true
-ipsec reload >/dev/null 2>&1 || true
-ipsec up "${conn_name}" >/dev/null 2>&1 || true
+start_ipsec_or_fail() {
+  ipsec rereadsecrets >/dev/null 2>&1 || true
+  ipsec reload >/dev/null 2>&1 || true
 
-if xfrm_state_present_pair; then
-  log "Installing XFRM ping policies (reqid-free)..."
-  xfrm_policy_install_tunnel_ips_no_reqid
-else
-  warn "No XFRM state found; tunnel not established."
+  local i
+  for i in $(seq 1 "${IPSEC_UP_TRIES}"); do
+    log "ipsec up ${conn_name} (try ${i}/${IPSEC_UP_TRIES})..."
+    if timeout "${IPSEC_UP_TIMEOUT}" ipsec up "${conn_name}"; then
+      return 0
+    fi
+    warn "ipsec up failed (try ${i})."
+    sleep 1
+  done
+  err "IPsec did not come up."
+  timeout 8 ipsec statusall | sed -n '1,160p' || true
+  exit 1
+}
+
+start_ipsec_or_fail
+if ! wait_for_xfrm_state; then
+  err "No XFRM state found; tunnel not established."
+  ip xfrm state 2>/dev/null || true
+  exit 1
 fi
 
-# firewall reconcile too
-if [[ -x /usr/local/sbin/simple-ipsec-firewall ]]; then
-  /usr/local/sbin/simple-ipsec-firewall reconcile >/dev/null 2>&1 || true
-fi
+log "Installing XFRM ping policies for tunnel endpoints..."
+xfrm_policy_install_tunnel_ips
 
-log "Done."
+log "Current tunnel policies:"
+ip xfrm policy 2>/dev/null | egrep -n "$(echo "${TUN_LOCAL_CIDR%%/*}" | sed 's/\./\\./g')|$(echo "${TUN_REMOTE_IP}" | sed 's/\./\\./g')" || true
+
+log "Ping test: ${TUN_REMOTE_IP}"
+ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && log "Ping OK." || warn "Ping failed (check SA counters: ip -s xfrm state)."
+
 EOF
 
-  # Health systemd units: run every HEALTH_INTERVAL_SEC (fix #2/#4/#5)
-  cat >"$HEALTH_SERVICE" <<'EOF'
-[Unit]
-Description=Simple IPsec - Auto-heal firewall and XFRM policies
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/simple-ipsec-health
-EOF
-
-  # Timer interval is injected from main script (we write it below each time)
-  cat >"$HEALTH_TIMER" <<EOF
-[Unit]
-Description=Simple IPsec - Auto-heal timer
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=${HEALTH_INTERVAL_SEC}
-AccuracySec=10
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" "$FW_HELPER" "$HEALTH_HELPER" || true
+  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" || true
   systemctl daemon-reload
-
-  # enable timer (safe if already enabled)
-  systemctl enable --now simple-ipsec-health.timer >/dev/null 2>&1 || true
 }
 
 enable_service() {
   local svc; svc="$(service_for "$1")"
+  # Enable should be fast; avoid blocking the CLI by NOT using --now for oneshot units.
   systemctl enable "$svc" >/dev/null 2>&1 || true
 }
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 \
-    || systemctl start --no-block "$svc" >/dev/null 2>&1 \
-    || true
+  # Start/restart in background so the UI returns immediately.
+  # For oneshot units, "start" may do nothing if it is already active (exited), so prefer restart.
+  systemctl restart --no-block "$svc" >/dev/null 2>&1     || systemctl start --no-block "$svc" >/dev/null 2>&1     || true
 }
 
 show_service_debug_if_failed() {
   local svc="$1"
+  # Give the unit a brief moment to fail fast (syntax errors, missing helper, etc.)
   sleep 1
   if systemctl is-failed --quiet "$svc" 2>/dev/null; then
     err "Service failed: $svc"
@@ -1373,6 +1151,8 @@ stop_disable_service() {
 
   systemctl stop "$svc" >/dev/null 2>&1 || true
   systemctl disable "$svc" >/dev/null 2>&1 || true
+
+  # خیلی مهم: اگر instance fail شده باشد، در list-units می‌ماند
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
 }
 
@@ -1382,7 +1162,7 @@ ipsec_reload_all() {
 }
 
 # -----------------------
-# Prompts (Create/Edit)
+# Prompts (Create/Edit) - always loops on invalid input
 # -----------------------
 prompt_role_create() {
   echo "Select server role:"
@@ -1618,24 +1398,52 @@ prompt_psk_keep_or_set() {
 # -----------------------
 apply_tunnel_files_and_service() {
   local tun="$1"
-
   write_conf "$tun"
   write_ipsec_conn_conf "$tun"
   write_ipsec_secrets_block "$tun"
   write_sysctl_persist
 
-  # ensure template+helpers+health exist
-  ensure_systemd_template
-
-  # firewall reconcile immediately (fix #4/#5)
-  [[ -x "$FW_HELPER" ]] && "$FW_HELPER" reconcile >/dev/null 2>&1 || true
-
-  ipsec_reload_all
-
   enable_service "$tun"
+
   log "Applying IPsec service..."
   start_or_restart_service_nb "$tun"
   show_service_debug_if_failed "$(service_for "$tun")"
+
+  # Quick readiness hint (don't block user for long)
+  for _ in 1 2 3; do
+    systemctl is-active --quiet "$(service_for "$tun")" && break
+    sleep 1
+  done
+
+  ipsec_reload_all
+}
+
+
+delete_ip_rules_for_mark_table() {
+  local mark_dec="$1"
+  local table="$2"
+
+  # هر rule که fwmark=mark_dec و lookup table دارد حذف می‌کنیم
+  ip rule show | awk -v m="$mark_dec" -v t="$table" '
+    $0 ~ ("fwmark " m) && $0 ~ (" lookup " t) {print $1}
+  ' | sed 's/://' | while read -r pref; do
+    ip rule del pref "$pref" 2>/dev/null || true
+  done
+}
+
+delete_routes_for_if_in_table() {
+  local ifc="$1"
+  local table="$2"
+
+  # Remove any routes in table that point to this interface (best-effort)
+  ip -4 route show table "$table" 2>/dev/null | awk -v dev="$ifc" '
+    $0 ~ (" dev " dev) {print}
+  ' | while read -r line; do
+    # line is a full route entry, delete it
+    ip -4 route del table "$table" $line 2>/dev/null || true
+  done
+
+  ip route flush cache >/dev/null 2>&1 || true
 }
 
 remove_tunnel_everything() {
@@ -1643,20 +1451,25 @@ remove_tunnel_everything() {
   read_conf "$tun" || true
 
   local ifc="${TUN_NAME:-$tun}"
+  local mark_dec=""
+  local table="${TABLE:-220}"
+
+  if [[ -n "${MARK:-}" ]]; then
+    mark_dec="$(mark_to_dec "${MARK}")"
+  fi
 
   stop_disable_service "$tun"
 
-  if [[ -x "$DOWN_HELPER" ]]; then
-    "$DOWN_HELPER" "$tun" >/dev/null 2>&1 || true
+  if [[ -x /usr/local/sbin/simple-ipsec-down ]]; then
+    /usr/local/sbin/simple-ipsec-down "$tun" >/dev/null 2>&1 || true
   fi
 
-  # remove firewall per-tunnel chain
-  if [[ -x "$FW_HELPER" ]]; then
-    # remove jump+chain using main script logic (best-effort)
-    # We can remove chain by calling firewall reconcile AFTER removing conf; but we need chain name.
-    # We'll remove now by calling firewall helper "reconcile" later and "cleanup-if-last" at end.
-    :
+
+  if [[ -n "${mark_dec:-}" ]]; then
+    delete_ip_rules_for_mark_table "$mark_dec" "$table"
   fi
+  # also delete any leftover routes in the table pointing to this interface
+  delete_routes_for_if_in_table "$ifc" "$table"
 
   ip link set "$ifc" down >/dev/null 2>&1 || true
   ip link del "$ifc" >/dev/null 2>&1 || true
@@ -1664,22 +1477,6 @@ remove_tunnel_everything() {
   rm -f "$(ipsec_conn_conf_for "$tun")" >/dev/null 2>&1 || true
   remove_secrets_block "$tun"
   rm -f "$(conf_path_for "$tun")" >/dev/null 2>&1 || true
-
-  # After conf removal: reconcile firewall (will drop per-tunnel chains not referenced)
-  # We also explicitly try to remove the per-tunnel chain name.
-  if [[ -x "$FW_HELPER" ]]; then
-    # compute chain name the same way firewall helper does
-    local tchain="SIP_${tun}"
-    if ((${#tchain} > 28)); then tchain="${tchain:0:28}"; fi
-    # Best-effort removal across backends:
-    for b in $(detect_iptables_bins); do
-      "$b" -t filter -D "$FW_GLOBAL_CHAIN" -j "$tchain" 2>/dev/null || true
-      "$b" -t filter -F "$tchain" 2>/dev/null || true
-      "$b" -t filter -X "$tchain" 2>/dev/null || true
-    done
-    "$FW_HELPER" reconcile >/dev/null 2>&1 || true
-    "$FW_HELPER" cleanup-if-last >/dev/null 2>&1 || true
-  fi
 
   write_sysctl_persist
   ipsec_reload_all
@@ -1732,8 +1529,6 @@ do_status_one() {
   local tun="$SELECTED_TUN"
   read_conf "$tun" || { err "Config not found."; return; }
 
-  local ifc="${TUN_NAME:-$tun}"
-
   echo -e "${MAG}===== Status: ${tun} =====${NC}"
   local svc mark_hex MARK_DEC
   svc="$(service_for "$tun")"
@@ -1742,10 +1537,10 @@ do_status_one() {
   else
     echo -e "Service: ${RED}inactive${NC}"
   fi
-  if ip link show "$ifc" >/dev/null 2>&1; then
-    echo -e "Interface: ${GRN}present${NC} (${ifc})"
+  if ip link show "$tun" >/dev/null 2>&1; then
+    echo -e "Interface: ${GRN}present${NC}"
   else
-    echo -e "Interface: ${RED}missing${NC} (${ifc})"
+    echo -e "Interface: ${RED}missing${NC}"
   fi
 
   MARK_DEC="$(mark_to_dec "$MARK")"
@@ -1764,7 +1559,6 @@ do_status_one() {
   else
     echo -e "Ping: ${RED}FAIL${NC} (${TUN_REMOTE_IP})"
   fi
-
   echo
   echo -e "${WHT}Service:${NC}"
   systemctl --no-pager --full status "$(service_for "$tun")" || true
@@ -1783,17 +1577,24 @@ do_status_one() {
   fi
 
   echo -e "${WHT}Interface:${NC}"
-  ip -d link show "$ifc" 2>/dev/null || { warn "Interface '$ifc' not found (service may be down)."; }
-  ip -4 addr show dev "$ifc" 2>/dev/null || true
+  ip -d link show "$tun" 2>/dev/null || { warn "Interface '$tun' not found (service may be down)."; }
+  ip -4 addr show dev "$tun" 2>/dev/null || true
   echo
 
   echo -e "${WHT}Counters:${NC}"
-  ip -s link show "$ifc" 2>/dev/null || true
+  ip -s link show "$tun" 2>/dev/null || true
   echo
 
   echo -e "${WHT}IPsec status (top):${NC}"
   ipsec statusall | sed -n '1,90p' || true
   echo
+
+  echo -e "${WHT}Ping remote tunnel IP:${NC} ${TUN_REMOTE_IP}"
+  if ping -c 3 -W 2 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
+    ok "Ping OK."
+  else
+    warn "Ping failed. (If SA is up but bytes=0, XFRM policy auto-fix should solve it; try restart service.)"
+  fi
 }
 
 do_status_all() {
@@ -1804,22 +1605,23 @@ do_status_all() {
     any="yes"
     echo -e "${CYA}--- ${t} ---${NC}"
     if read_conf "$t"; then
-      local ifc="${TUN_NAME:-$t}"
       local svc mark_hex MARK_DEC
       svc="$(service_for "$t")"
 
+      # Service status (systemd oneshot may be "active (exited)" after a successful start)
       if systemctl is-active --quiet "$svc"; then
         echo -e "Service: ${GRN}active${NC}"
       else
         echo -e "Service: ${RED}inactive${NC}"
       fi
 
-      if ip link show "$ifc" >/dev/null 2>&1; then
-        echo -e "Interface: ${GRN}present${NC} (${ifc})"
+      if ip link show "$t" >/dev/null 2>&1; then
+        echo -e "Interface: ${GRN}present${NC}"
       else
-        echo -e "Interface: ${RED}missing${NC} (${ifc})"
+        echo -e "Interface: ${RED}missing${NC}"
       fi
 
+      # XFRM state for this tunnel mark
       MARK_DEC="$(mark_to_dec "$MARK")"
       mark_hex=$(printf "0x%08x" "$MARK_DEC")
       if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
@@ -1830,6 +1632,7 @@ do_status_all() {
         echo -e "XFRM state: ${RED}missing${NC}"
       fi
 
+      # Tunnel health
       if ping -c 1 -W 1 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
         echo -e "Tunnel: ${GRN}active${NC} (ping OK)"
       else
@@ -1922,6 +1725,14 @@ do_edit() {
 
   local old_role="$ROLE"
   local old_pair="$PAIR_CODE"
+  local old_mark="$MARK"
+  local old_table="$TABLE"
+  local old_mtu="$MTU"
+  local old_fwd="$ENABLE_FORWARDING"
+  local old_rpf="$DISABLE_RPFILTER"
+  local old_svm="$ENABLE_SRC_VALID_MARK"
+  local old_dp="$ENABLE_DISABLE_POLICY"
+  local old_psk="$PSK"
   local old_name="$TUN_NAME"
 
   prompt_role_edit_keep
@@ -1963,8 +1774,8 @@ do_force_fix_one() {
   read_conf "$tun" || { err "Config not found."; return; }
 
   log "Force repair XFRM policies for: $tun"
-  if [[ -x "$FIX_HELPER" ]]; then
-    "$FIX_HELPER" "$tun" || true
+  if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
+    /usr/local/sbin/simple-ipsec-fix "$tun" || true
   else
     warn "Fix helper not found; restarting service as fallback."
     timeout "${SYSTEMCTL_RESTART_TIMEOUT}" systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
@@ -1977,9 +1788,9 @@ do_force_fix_all() {
   while IFS= read -r t; do
     [[ -n "$t" ]] || continue
     any="yes"
-    if [[ -x "$FIX_HELPER" ]]; then
+    if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
       echo -e "${CYA}--- ${t} ---${NC}"
-      "$FIX_HELPER" "$t" || true
+      /usr/local/sbin/simple-ipsec-fix "$t" || true
       echo
     else
       timeout "${SYSTEMCTL_RESTART_TIMEOUT}" systemctl restart "$(service_for "$t")" >/dev/null 2>&1 || true
@@ -2024,8 +1835,8 @@ menu() {
     echo -e "${CYA}3)${NC} Status (one tunnel)"
     echo -e "${CYA}4)${NC} Status (ALL tunnels)"
     echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
-    echo -e "${CYA}6)${NC} Fix (one tunnel)"
-    echo -e "${CYA}7)${NC} Fix (ALL tunnels)"
+    echo -e "${CYA}6)${NC} Force fix policies (one tunnel)"
+    echo -e "${CYA}7)${NC} Force fix policies (ALL tunnels)"
     echo -e "${CYA}8)${NC} List tunnels"
     echo -e "${CYA}9)${NC} Delete tunnel"
     echo -e "${CYA}0)${NC} Exit"
