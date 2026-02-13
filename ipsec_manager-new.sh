@@ -25,7 +25,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1375"
+MTU_DEFAULT="1378"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -729,8 +729,33 @@ ensure_vti() {
   ip link set "${TUN_NAME}" up
 }
 
-ensure_tunnel_routes() { true; }
-ensure_mangle_mark_rules() { true; }
+# ensure_tunnel_routes() { true; }
+# ensure_mangle_mark_rules() { true; }
+
+ensure_tunnel_routes() {
+  # route for the /30 and remote tunnel IP in per-tunnel routing table
+  local subnet
+  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
+  ip -4 route replace table "${TABLE}" "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
+  ip -4 route replace table "${TABLE}" "${TUN_REMOTE_IP}/32" dev "${TUN_NAME}" scope link 2>/dev/null || true
+  ip route flush cache >/dev/null 2>&1 || true
+}
+
+ensure_mangle_mark_rules() {
+  # SAFE marking: only mark traffic to remote tunnel endpoint IP
+  local md
+  md="$(mark_to_dec "${MARK}")"
+
+  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff"
+
+  # Mark inbound packets arriving from the tunnel (so replies follow same table if needed)
+  iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || \
+    iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff"
+
+  # ip rule (stable preference already computed as RULE_PREF)
+  ip rule add pref "${RULE_PREF}" fwmark "${md}" table "${TABLE}" 2>/dev/null || true
+}
 
 mark_hex_from_conf() {
   local md
@@ -740,11 +765,10 @@ mark_hex_from_conf() {
 
 # Multi-tunnel safe: state present ONLY if mark matches this tunnel
 xfrm_state_present() {
-  local mh hx re
+  local mh hx
   mh="$(mark_hex_from_conf)"
   hx="${mh#0x}"
-  re="mark 0x0*${hx}/0xffffffff"
-  ip xfrm state 2>/dev/null | grep -Eqi "$re"
+  ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}/0xffffffff"
 }
 
 wait_for_xfrm_state() {
@@ -936,8 +960,10 @@ cleanup_firewall_rules() {
 }
 
 cleanup_iptables_mangle_rules() {
-  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
-  iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
+  local md
+  md="$(mark_to_dec "${MARK}")"
+  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || true
 }
 
 cleanup_xfrm_policies() {
@@ -1573,9 +1599,9 @@ do_status_one() {
   fi
 
   MARK_DEC="$(mark_to_dec "$MARK")"
-  mark_hex=$(printf "0x%08x" "$MARK_DEC")
-
-  if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}/0xffffffff"; then
+  mark_hex="$(printf "0x%x" "$MARK_DEC")"
+  hx="${mark_hex#0x}"
+  if ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}/0xffffffff"; then
     echo -e "XFRM state: ${GRN}present${NC} (by MARK)"
   else
     echo -e "XFRM state: ${RED}missing${NC} (by MARK)"
@@ -1648,8 +1674,9 @@ do_status_all() {
       fi
 
       MARK_DEC="$(mark_to_dec "$MARK")"
-      mark_hex=$(printf "0x%08x" "$MARK_DEC")
-      if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}/0xffffffff"; then
+      mark_hex="$(printf "0x%x" "$MARK_DEC")"
+      hx="${mark_hex#0x}"
+      if ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}/0xffffffff"; then
         echo -e "XFRM state: ${GRN}present${NC} (by MARK)"
       else
         echo -e "XFRM state: ${RED}missing${NC} (by MARK)"
