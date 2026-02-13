@@ -27,7 +27,7 @@ WAIT_HELPER="/usr/local/sbin/simple-ipsec-wait"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1436"
+MTU_DEFAULT="1280"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
