@@ -1861,7 +1861,8 @@ do_status_one() {
   MARK_DEC="$(mark_to_dec "$MARK")"
   mark_hex="$(printf "0x%x" "$MARK_DEC")"
   hx="${mark_hex#0x}"
-  if ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}/0xffffffff"; then
+  # if ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}/0xffffffff"; then
+  if ip xfrm state 2>/dev/null | grep -Eqi "mark 0x0*${hx}(/0x[0-9a-f]+)?"; then
     echo -e "XFRM state: ${GRN}present${NC} (by MARK)"
   else
     echo -e "XFRM state: ${RED}missing${NC} (by MARK)"
