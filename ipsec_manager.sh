@@ -1202,9 +1202,8 @@ enable_service() {
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  # Start/restart in background so the UI returns immediately.
-  # For oneshot units, "start" may do nothing if it is already active (exited), so prefer restart.
-  systemctl restart --no-block "$svc" >/dev/null 2>&1     || systemctl start --no-block "$svc" >/dev/null 2>&1     || true
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  systemctl restart --no-block "$svc" >/dev/null 2>&1 || systemctl start --no-block "$svc" >/dev/null 2>&1 || true
 }
 
 show_service_debug_if_failed() {
@@ -1475,6 +1474,8 @@ prompt_psk_keep_or_set() {
 # -----------------------
 apply_tunnel_files_and_service() {
   local tun="$1"
+  local svc; svc="$(service_for "$tun")"
+
   write_conf "$tun"
   write_ipsec_conn_conf "$tun"
   write_ipsec_secrets_block "$tun"
@@ -1484,15 +1485,30 @@ apply_tunnel_files_and_service() {
 
   log "Applying IPsec service..."
   start_or_restart_service_nb "$tun"
-  show_service_debug_if_failed "$(service_for "$tun")"
 
-  # Quick readiness hint (don't block user for long)
+  local active="no"
   for _ in 1 2 3; do
-    systemctl is-active --quiet "$(service_for "$tun")" && break
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      active="yes"
+      break
+    fi
     sleep 1
   done
 
+  if [ "$active" != "yes" ]; then
+    if systemctl is-failed --quiet "$svc" 2>/dev/null; then
+      warn "Service is FAILED for now (peer probably not ready). It will retry automatically."
+    else
+      warn "Service is not active yet (maybe negotiating). It should become active once the peer is ready."
+    fi
+  fi
+
   ipsec_reload_all
+
+  # (Optional) Only show debug if user explicitly asked for verbose/debug
+  # if [ "${DEBUG:-0}" = "1" ]; then
+  #   show_service_debug_if_failed "$svc"
+  # fi
 }
 
 iptables_delete_all_marks_for_if() {
