@@ -1202,7 +1202,6 @@ enable_service() {
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
   systemctl restart --no-block "$svc" >/dev/null 2>&1 || systemctl start --no-block "$svc" >/dev/null 2>&1 || true
 }
 
@@ -1227,8 +1226,6 @@ stop_disable_service() {
 
   systemctl stop "$svc" >/dev/null 2>&1 || true
   systemctl disable "$svc" >/dev/null 2>&1 || true
-
-  # خیلی مهم: اگر instance fail شده باشد، در list-units می‌ماند
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
 }
 
