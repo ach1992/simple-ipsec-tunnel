@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1345"
+MTU_DEFAULT="1381"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -881,45 +881,77 @@ xfrm_reqid_from_state() {
 }
 
 xfrm_policy_install_tunnel_ips() {
-  local lip rip reqid md
+  local lip rip reqid md mh
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
   md="$(mark_dec)"
+  mh="$(mark_hex)"
 
   reqid="$(xfrm_reqid_from_state || true)"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
-  # best-effort delete old policies (with and without mark)
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
+  # Delete any previous versions (best effort). Some iproute2 builds support "mask" syntax,
+  # others only accept "mark <val>".
+  _xfrm_pol_del() {
+    local dir="$1" src="$2" dst="$3"
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" mask 0xffffffff 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" mask 0xffffffff 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" 2>/dev/null || true
+  }
 
-  # add policies for tunnel endpoint IPs (ping will work deterministically)
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_add_marked() {
+    local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
+    # Preferred: mark + mask
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    # Fallback: mark only (no "mask" keyword)
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  }
 
-  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_add_unmarked() {
+    local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
+    ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"       tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null || true
+  }
+																												
 
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
-# Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
-# early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
-# other traffic, since selectors are strict /32 tunnel endpoint IPs.
-ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_del out "${lip}/32" "${rip}/32"
+  _xfrm_pol_del in  "${rip}/32" "${lip}/32"
+																												 
+																										
+																									  
+																	
+  _xfrm_pol_del fwd "${lip}/32" "${rip}/32"
+																											   
 
-ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-  tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  # Marked policies (if supported)
+  if ! _xfrm_pol_add_marked out "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"; then
+    warn "Could not add MARKed XFRM OUT policy (will rely on unmarked fallback)."
+  fi
+  if ! _xfrm_pol_add_marked in  "${rip}/32" "${lip}/32" "${REMOTE_WAN_IP}" "${LOCAL_WAN_IP}"  "${reqid}"; then
+    warn "Could not add MARKed XFRM IN policy (will rely on unmarked fallback)."
+  fi
+  if ! _xfrm_pol_add_marked fwd "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"; then
+    warn "Could not add MARKed XFRM FWD policy (will rely on unmarked fallback)."
+  fi
 
-ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  # Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
+  # early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
+  # other traffic, since selectors are strict /32 tunnel endpoint IPs.
+  _xfrm_pol_add_unmarked out "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"
+  _xfrm_pol_add_unmarked in  "${rip}/32" "${lip}/32" "${REMOTE_WAN_IP}" "${LOCAL_WAN_IP}"  "${reqid}"
+  _xfrm_pol_add_unmarked fwd "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"
 }
 
 start_ipsec_or_fail() {
@@ -1192,17 +1224,17 @@ wait_for_xfrm_state() {
   done
   return 1
 
-# Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
-# early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
-# other traffic, since selectors are strict /32 tunnel endpoint IPs.
-ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+																										
+																									  
+																	
+															
+																											   
 
-ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-  tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+														   
+																											  
 
-ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+															
+																											   
 }
 
 xfrm_reqid_from_state() {
@@ -1229,34 +1261,72 @@ xfrm_reqid_from_state() {
 }
 
 xfrm_policy_install_tunnel_ips() {
-  local lip rip reqid md
+  local lip rip reqid md mh
   lip="$(local_tun_ip)"
   rip="${TUN_REMOTE_IP}"
   md="$(mark_dec)"
+  mh="$(mark_hex)"
 
   reqid="$(xfrm_reqid_from_state || true)"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
-  # Delete old (best-effort)
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
+  # Delete any previous versions (best effort). Some iproute2 builds support "mask" syntax,
+  # others only accept "mark <val>".
+  _xfrm_pol_del() {
+    local dir="$1" src="$2" dst="$3"
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" mask 0xffffffff 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" mask 0xffffffff 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" 2>/dev/null || true
+  }
 
-  # Add policies for tunnel endpoints
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_add_marked() {
+    local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
+    # Preferred: mark + mask
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    # Fallback: mark only (no "mask" keyword)
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  }
 
-  ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_add_unmarked() {
+    local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
+    ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"       tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null || true
+  }
+																												
 
-  ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
-    mark "${md}" mask 0xffffffff \
-    tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+  _xfrm_pol_del out "${lip}/32" "${rip}/32"
+  _xfrm_pol_del in  "${rip}/32" "${lip}/32"
+  _xfrm_pol_del fwd "${lip}/32" "${rip}/32"
+
+  # Marked policies (if supported)
+  if ! _xfrm_pol_add_marked out "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"; then
+    warn "Could not add MARKed XFRM OUT policy (will rely on unmarked fallback)."
+  fi
+  if ! _xfrm_pol_add_marked in  "${rip}/32" "${lip}/32" "${REMOTE_WAN_IP}" "${LOCAL_WAN_IP}"  "${reqid}"; then
+    warn "Could not add MARKed XFRM IN policy (will rely on unmarked fallback)."
+  fi
+  if ! _xfrm_pol_add_marked fwd "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"; then
+    warn "Could not add MARKed XFRM FWD policy (will rely on unmarked fallback)."
+  fi
+
+  # Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
+  # early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
+  # other traffic, since selectors are strict /32 tunnel endpoint IPs.
+  _xfrm_pol_add_unmarked out "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"
+  _xfrm_pol_add_unmarked in  "${rip}/32" "${lip}/32" "${REMOTE_WAN_IP}" "${LOCAL_WAN_IP}"  "${reqid}"
+  _xfrm_pol_add_unmarked fwd "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"
 }
 
 start_ipsec_or_fail() {
