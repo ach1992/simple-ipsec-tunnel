@@ -1074,7 +1074,7 @@ local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 mark_hex_from_conf() {
   local md
   md="$(mark_to_dec "${MARK}")"
-  printf "0x%08x" "$md"
+  printf "0x%x" "$md"
 }
 
 # ---- XFRM detection (match by MARK, tolerant to leading zeros) ----
