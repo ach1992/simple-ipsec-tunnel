@@ -1256,8 +1256,6 @@ xfrm_policy_install_tunnel_ips() {
   # others only accept "mark <val>".
   _xfrm_pol_del() {
     local dir="$1" src="$2" dst="$3"
-																												 
-																												 
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
