@@ -1202,8 +1202,9 @@ enable_service() {
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 || systemctl start --no-block "$svc" >/dev/null 2>&1 || true
+  # Start/restart in background so the UI returns immediately.
+  # For oneshot units, "start" may do nothing if it is already active (exited), so prefer restart.
+  systemctl restart --no-block "$svc" >/dev/null 2>&1     || systemctl start --no-block "$svc" >/dev/null 2>&1     || true
 }
 
 show_service_debug_if_failed() {
