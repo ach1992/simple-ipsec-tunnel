@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1436"
+MTU_DEFAULT="1345"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
