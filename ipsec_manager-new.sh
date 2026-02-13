@@ -735,14 +735,16 @@ ensure_mangle_mark_rules() { true; }
 mark_hex_from_conf() {
   local md
   md="$(mark_to_dec "${MARK}")"
-  printf "0x%08x" "$md"
+  printf "0x%x" "$md"
 }
 
 # Multi-tunnel safe: state present ONLY if mark matches this tunnel
 xfrm_state_present() {
-  local mh
+  local mh hx re
   mh="$(mark_hex_from_conf)"
-  ip xfrm state 2>/dev/null | grep -q "mark ${mh}/0xffffffff"
+  hx="${mh#0x}"
+  re="mark 0x0*${hx}/0xffffffff"
+  ip xfrm state 2>/dev/null | grep -Eqi "$re"
 }
 
 wait_for_xfrm_state() {
@@ -901,13 +903,17 @@ mark_hex_from_conf() {
 }
 
 xfrm_state_mark_dec() {
-  local mh m
+  local mh hx re m
   mh="$(mark_hex_from_conf)"
-  m="$(ip xfrm state 2>/dev/null | awk -v mh="${mh}" '
+  hx="${mh#0x}"
+  re="^0x0*${hx}/0xffffffff$"
+
+  m="$(ip xfrm state 2>/dev/null | awk -v re="${re}" '
     $1=="src" {inblk=1}
-    inblk && $1=="mark" && $2 ~ mh {print $2; exit}
+    inblk && $1=="mark" && $2 ~ re {print $2; exit}
     inblk && /^$/ {inblk=0}
   ' | head -n1)"
+
   [[ -n "${m:-}" ]] || return 0
   m="${m%%/*}"
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
@@ -1038,16 +1044,20 @@ xfrm_state_mark_dec() {
 }
 
 xfrm_reqid_from_state() {
-  local mh reqid
+  local mh hx re reqid
   mh="$(mark_hex_from_conf)"
-  reqid="$(ip xfrm state 2>/dev/null | awk -v mh="${mh}" '
+  hx="${mh#0x}"
+  re="^0x0*${hx}/0xffffffff$"
+
+  reqid="$(ip xfrm state 2>/dev/null | awk -v re="${re}" '
     $1=="src" {inblk=1}
-    inblk && $1=="mark" && $2 ~ mh {markok=1}
+    inblk && $1=="mark" && $2 ~ re {markok=1}
     inblk && markok && $1=="proto" && $2=="esp" {
       for(i=1;i<=NF;i++) if($i=="reqid") {print $(i+1); exit}
     }
     inblk && /^$/ {inblk=0; markok=0}
   ' | head -n1)"
+
   reqid="${reqid%%(*}"
   reqid="${reqid//[^0-9]/}"
   [[ -n "${reqid:-}" ]] || return 0
@@ -1102,6 +1112,12 @@ start_ipsec_or_fail() {
   timeout 8 ipsec statusall | sed -n '1,160p' || true
   exit 1
 }
+
+if xfrm_state_present; then
+  log "XFRM state already present for MARK; skipping ipsec up and only reinstalling policies."
+  xfrm_policy_install_tunnel_ips
+  exit 0
+fi
 
 start_ipsec_or_fail
 if ! wait_for_xfrm_state; then
