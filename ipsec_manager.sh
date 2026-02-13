@@ -4,12 +4,6 @@ set -Eeuo pipefail
 # ============================================================
 #  Simple IPsec Tunnel (IKEv2 + VTI) - Multi Tunnel Manager
 #  Optimized for Debian/Ubuntu (multiple versions)
-#
-#  Key points:
-#   - Auto-fix tunnel ping: installs XFRM policies for tunnel IPs using REAL mark from xfrm state
-#   - Idempotent: no duplicate ip rules/routes/iptables rules
-#   - Full cleanup on delete/stop: xfrm policies + ip rules/routes + iptables + interface
-#   - Robust interactive UX: invalid inputs never exit the script; loops everywhere
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
