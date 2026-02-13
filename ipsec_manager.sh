@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1381"
+MTU_DEFAULT="1436"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -894,8 +894,8 @@ xfrm_policy_install_tunnel_ips() {
   # others only accept "mark <val>".
   _xfrm_pol_del() {
     local dir="$1" src="$2" dst="$3"
-    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" mask 0xffffffff 2>/dev/null || true
-    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" mask 0xffffffff 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" 2>/dev/null || true
@@ -904,10 +904,10 @@ xfrm_policy_install_tunnel_ips() {
   _xfrm_pol_add_marked() {
     local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
     # Preferred: mark + mask
-    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
       return 0
     fi
-    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
       return 0
     fi
     # Fallback: mark only (no "mask" keyword)
@@ -924,16 +924,10 @@ xfrm_policy_install_tunnel_ips() {
     local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
     ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"       tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null || true
   }
-																												
 
   _xfrm_pol_del out "${lip}/32" "${rip}/32"
   _xfrm_pol_del in  "${rip}/32" "${lip}/32"
-																												 
-																										
-																									  
-																	
   _xfrm_pol_del fwd "${lip}/32" "${rip}/32"
-																											   
 
   # Marked policies (if supported)
   if ! _xfrm_pol_add_marked out "${lip}/32" "${rip}/32" "${LOCAL_WAN_IP}"  "${REMOTE_WAN_IP}" "${reqid}"; then
@@ -1093,9 +1087,9 @@ cleanup_xfrm_policies() {
   rip="${TUN_REMOTE_IP}"
   md="$(mark_dec)"
 
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${md}" mask 0xffffffff 2>/dev/null || true
-  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${md}" mask 0xffffffff 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${md}" 2>/dev/null || true
+  ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${md}" 2>/dev/null || true
+  ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${md}" 2>/dev/null || true
 
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
@@ -1223,18 +1217,6 @@ wait_for_xfrm_state() {
     sleep 1
   done
   return 1
-
-																										
-																									  
-																	
-															
-																											   
-
-														   
-																											  
-
-															
-																											   
 }
 
 xfrm_reqid_from_state() {
@@ -1274,8 +1256,10 @@ xfrm_policy_install_tunnel_ips() {
   # others only accept "mark <val>".
   _xfrm_pol_del() {
     local dir="$1" src="$2" dst="$3"
-    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" mask 0xffffffff 2>/dev/null || true
-    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" mask 0xffffffff 2>/dev/null || true
+																												 
+																												 
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
+    ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" 2>/dev/null || true
@@ -1284,10 +1268,10 @@ xfrm_policy_install_tunnel_ips() {
   _xfrm_pol_add_marked() {
     local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
     # Preferred: mark + mask
-    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${md}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
       return 0
     fi
-    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}" mask 0xffffffff         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
+    if ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"         mark "${mh}"         tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null; then
       return 0
     fi
     # Fallback: mark only (no "mask" keyword)
@@ -1304,7 +1288,6 @@ xfrm_policy_install_tunnel_ips() {
     local dir="$1" src="$2" dst="$3" tsrc="$4" tdst="$5" rid="$6"
     ip xfrm policy add src "${src}" dst "${dst}" dir "${dir}"       tmpl src "${tsrc}" dst "${tdst}" proto esp reqid "${rid}" mode tunnel 2>/dev/null || true
   }
-																												
 
   _xfrm_pol_del out "${lip}/32" "${rip}/32"
   _xfrm_pol_del in  "${rip}/32" "${lip}/32"
