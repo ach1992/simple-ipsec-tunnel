@@ -25,7 +25,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1370"
+MTU_DEFAULT="1375"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -134,31 +134,12 @@ is_mark() {
 }
 
 mark_to_dec() {
-  local m="${1:-}"
-  m="${m%%/*}"
-  m="${m//[[:space:]]/}"
-
-  # dotted quad: a.b.c.d
-  if [[ "$m" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IFS='.' read -r a b c d <<< "$m"
-    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
-    return 0
-  fi
-
-  # hex: 0x....
-  if [[ "$m" =~ ^0x[0-9a-fA-F]+$ ]]; then
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then
     echo $((16#${m#0x}))
-    return 0
-  fi
-
-  # decimal
-  if [[ "$m" =~ ^[0-9]+$ ]]; then
+  else
     echo "$m"
-    return 0
   fi
-
-  # fallback (invalid)
-  echo 0
 }
 
 # Stable preference to avoid duplicate ip rules
@@ -636,31 +617,8 @@ warn() { echo "[simple-ipsec-up:${tun}][WARN] $*" >&2; }
 err()  { echo "[simple-ipsec-up:${tun}][ERROR] $*" >&2; }
 
 mark_to_dec() {
-  local m="${1:-}"
-  m="${m%%/*}"
-  m="${m//[[:space:]]/}"
-
-  # dotted quad: a.b.c.d
-  if [[ "$m" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IFS='.' read -r a b c d <<< "$m"
-    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
-    return 0
-  fi
-
-  # hex: 0x....
-  if [[ "$m" =~ ^0x[0-9a-fA-F]+$ ]]; then
-    echo $((16#${m#0x}))
-    return 0
-  fi
-
-  # decimal
-  if [[ "$m" =~ ^[0-9]+$ ]]; then
-    echo "$m"
-    return 0
-  fi
-
-  # fallback (invalid)
-  echo 0
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
@@ -933,33 +891,9 @@ source "$CONF_FILE"
 conn_name="simple-ipsec-${tun}"
 
 mark_to_dec() {
-  local m="${1:-}"
-  m="${m%%/*}"
-  m="${m//[[:space:]]/}"
-
-  # dotted quad: a.b.c.d
-  if [[ "$m" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IFS='.' read -r a b c d <<< "$m"
-    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
-    return 0
-  fi
-
-  # hex: 0x....
-  if [[ "$m" =~ ^0x[0-9a-fA-F]+$ ]]; then
-    echo $((16#${m#0x}))
-    return 0
-  fi
-
-  # decimal
-  if [[ "$m" =~ ^[0-9]+$ ]]; then
-    echo "$m"
-    return 0
-  fi
-
-  # fallback (invalid)
-  echo 0
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
-
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 mark_hex_from_conf() {
@@ -1070,33 +1004,9 @@ warn() { echo "[simple-ipsec-fix:${tun}][WARN] $*" >&2; }
 err()  { echo "[simple-ipsec-fix:${tun}][ERROR] $*" >&2; }
 
 mark_to_dec() {
-  local m="${1:-}"
-  m="${m%%/*}"
-  m="${m//[[:space:]]/}"
-
-  # dotted quad: a.b.c.d
-  if [[ "$m" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IFS='.' read -r a b c d <<< "$m"
-    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
-    return 0
-  fi
-
-  # hex: 0x....
-  if [[ "$m" =~ ^0x[0-9a-fA-F]+$ ]]; then
-    echo $((16#${m#0x}))
-    return 0
-  fi
-
-  # decimal
-  if [[ "$m" =~ ^[0-9]+$ ]]; then
-    echo "$m"
-    return 0
-  fi
-
-  # fallback (invalid)
-  echo 0
+  local m="$1"
+  if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
-
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 mark_hex_from_conf() {
