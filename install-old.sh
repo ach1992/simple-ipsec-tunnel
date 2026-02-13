@@ -8,7 +8,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 REPO_OWNER="ach1992"
 REPO_NAME="simple-ipsec-tunnel"
 REPO_DEFAULT_REF="main"   # online (main branch)
-SCRIPT_NAME_IN_REPO="ipsec_manager-new.sh"
+SCRIPT_NAME_IN_REPO="ipsec_manager-old.sh"
 
 INSTALL_PATH="/usr/local/bin/simple-ipsec"
 TMP_DIR="/tmp/simple-ipsec-install.$$"
@@ -22,7 +22,7 @@ err()  { echo -e "${RED}[ERROR]${NC} $*"; }
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     err "Run as root. Example:"
-    echo "  curl -fsSL https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_DEFAULT_REF}/installnew.sh | sudo bash"
+    echo "  curl -fsSL https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_DEFAULT_REF}/install-old.sh | sudo bash"
     exit 1
   fi
 }
@@ -99,7 +99,7 @@ MODE=""  # offline | online | latest
 usage() {
   cat <<'EOF'
 Usage:
-  sudo bash installnew.sh [--offline | --online | --latest-release]
+  sudo bash install-old.sh [--offline | --online | --latest-release]
 
 Options:
   --offline         Install using local files (no download from GitHub)
@@ -214,7 +214,7 @@ download_script_offline() {
 
   err "Offline mode selected, but ${SCRIPT_NAME_IN_REPO} was not found."
   err "Checked: script directory, current directory, /root, and common locations."
-  err "Fix: place ${SCRIPT_NAME_IN_REPO} next to installnew.sh, or in /root."
+  err "Fix: place ${SCRIPT_NAME_IN_REPO} next to install-old.sh, or in /root."
   exit 1
 }
 
