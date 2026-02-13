@@ -555,7 +555,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 
-TimeoutStartSec=180
+TimeoutStartSec=45
 TimeoutStopSec=30
 
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
