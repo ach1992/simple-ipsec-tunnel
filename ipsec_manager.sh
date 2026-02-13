@@ -22,6 +22,8 @@ SECRETS_FILE="/etc/ipsec.d/simple-ipsec.secrets"
 SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec@.service"
 UP_HELPER="/usr/local/sbin/simple-ipsec-up"
 DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
+WAIT_SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec-wait@.service"
+WAIT_HELPER="/usr/local/sbin/simple-ipsec-wait"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
@@ -556,15 +558,25 @@ RemainAfterExit=yes
 TimeoutStartSec=180
 TimeoutStopSec=30
 
-Restart=on-failure
-RestartSec=10
-StartLimitIntervalSec=0
-
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+  # -----------------------
+  # WAIT (non-blocking retry helper)
+  # -----------------------
+  cat >"$WAIT_SERVICE_TEMPLATE" <<'EOF'
+[Unit]
+Description=Simple IPsec Tunnel - wait/retry peer (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simple-ipsec-wait %i
 EOF
 
   # -----------------------
@@ -1026,6 +1038,62 @@ EOF
 
 
   # -----------------------
+  # WAIT helper (non-blocking peer readiness loop)
+  # -----------------------
+  cat >"$WAIT_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/etc/simple-ipsec"
+TUNNELS_DIR="$APP_DIR/tunnels.d"
+
+tun="${1:-}"
+[[ -n "$tun" ]] || { echo "Usage: simple-ipsec-wait <tunnel_name>" >&2; exit 2; }
+
+conf="$TUNNELS_DIR/${tun}.conf"
+[[ -f "$conf" ]] || exit 0
+
+# shellcheck disable=SC1090
+source "$conf"
+
+svc="simple-ipsec@${tun}.service"
+
+mark_to_dec() { [[ "${1:-}" =~ ^0x ]] && echo $((16#${1#0x})) || echo "${1:-}"; }
+
+MARK_DEC="$(mark_to_dec "${MARK:-}")"
+mark_hex=""
+if [[ -n "${MARK_DEC:-}" ]]; then
+  mark_hex=$(printf "0x%08x" "$MARK_DEC")
+fi
+
+max="${WAIT_PEER_MAX:-600}"   # seconds
+step="${WAIT_PEER_STEP:-10}"  # seconds
+end=$((SECONDS + max))
+
+has_state() {
+  if [[ -n "${mark_hex:-}" ]] && ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
+    return 0
+  fi
+  if [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" ]] && ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
+    return 0
+  fi
+  return 1
+}
+
+while (( SECONDS < end )); do
+  if has_state; then
+    exit 0
+  fi
+
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  systemctl restart --no-block "$svc" >/dev/null 2>&1 || true
+  sleep "$step"
+done
+
+exit 0
+EOF
+
+  # -----------------------
   # FIX helper (force XFRM policy repair)
   # -----------------------
   FIX_HELPER="/usr/local/sbin/simple-ipsec-fix"
@@ -1190,7 +1258,7 @@ ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && log "Ping OK." || warn "Pin
 
 EOF
 
-  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" || true
+  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$WAIT_HELPER" "$FIX_HELPER" || true
   systemctl daemon-reload
 }
 
@@ -1202,7 +1270,9 @@ enable_service() {
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 || systemctl start --no-block "$svc" >/dev/null 2>&1 || true
+  # Start/restart in background so the UI returns immediately.
+  # For oneshot units, "start" may do nothing if it is already active (exited), so prefer restart.
+  systemctl restart --no-block "$svc" >/dev/null 2>&1     || systemctl start --no-block "$svc" >/dev/null 2>&1     || true
 }
 
 show_service_debug_if_failed() {
@@ -1226,6 +1296,7 @@ stop_disable_service() {
 
   systemctl stop "$svc" >/dev/null 2>&1 || true
   systemctl disable "$svc" >/dev/null 2>&1 || true
+
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
 }
 
@@ -1471,8 +1542,6 @@ prompt_psk_keep_or_set() {
 # -----------------------
 apply_tunnel_files_and_service() {
   local tun="$1"
-  local svc; svc="$(service_for "$tun")"
-
   write_conf "$tun"
   write_ipsec_conn_conf "$tun"
   write_ipsec_secrets_block "$tun"
@@ -1482,30 +1551,16 @@ apply_tunnel_files_and_service() {
 
   log "Applying IPsec service..."
   start_or_restart_service_nb "$tun"
+  systemctl start --no-block "simple-ipsec-wait@${tun}.service" >/dev/null 2>&1 || true
+  show_service_debug_if_failed "$(service_for "$tun")"
 
-  local active="no"
+  # Quick readiness hint (don't block user for long)
   for _ in 1 2 3; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      active="yes"
-      break
-    fi
+    systemctl is-active --quiet "$(service_for "$tun")" && break
     sleep 1
   done
 
-  if [ "$active" != "yes" ]; then
-    if systemctl is-failed --quiet "$svc" 2>/dev/null; then
-      warn "Service is FAILED for now (peer probably not ready). It will retry automatically."
-    else
-      warn "Service is not active yet (maybe negotiating). It should become active once the peer is ready."
-    fi
-  fi
-
   ipsec_reload_all
-
-  # (Optional) Only show debug if user explicitly asked for verbose/debug
-  # if [ "${DEBUG:-0}" = "1" ]; then
-  #   show_service_debug_if_failed "$svc"
-  # fi
 }
 
 iptables_delete_all_marks_for_if() {
