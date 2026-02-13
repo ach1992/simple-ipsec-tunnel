@@ -736,6 +736,7 @@ ensure_firewall_rules() {
   iptables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -p udp --dport 500 -j ACCEPT
   iptables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p udp --dport 4500 -j ACCEPT
   iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p esp -j ACCEPT
+  iptables -C INPUT -i "${TUN_NAME}" -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -i "${TUN_NAME}" -p icmp -j ACCEPT
 
   iptables -C FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 2 -i "${TUN_NAME}" -j ACCEPT
   iptables -C FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 3 -o "${TUN_NAME}" -j ACCEPT
@@ -756,6 +757,10 @@ ensure_vti() {
   ip addr flush dev "${TUN_NAME}" >/dev/null 2>&1 || true
   ip addr add "${TUN_LOCAL_CIDR}" dev "${TUN_NAME}"
   ip link set "${TUN_NAME}" up
+  # Avoid drops due to reverse path filtering on tunnel interface
+  sysctl -w "net.ipv4.conf.${TUN_NAME}.rp_filter=0" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.all.rp_filter=0" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
 }
 
 ensure_tunnel_routes() {
@@ -1148,7 +1153,7 @@ local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 print_header() {
   echo -e "${BOLD}============================================================${NC}"
-  echo -e "${BOLD} Force fix policies${NC}"
+  echo -e "${BOLD} Force fix policies${NC}  ${DIM}(no logic change, cleaner output)${NC}"
   echo -e "${BOLD}------------------------------------------------------------${NC}"
   echo -e "${BOLD} Tunnel:${NC} ${tun}"
   echo -e "${BOLD} Public:${NC} ${LOCAL_WAN_IP}  <->  ${REMOTE_WAN_IP}"
