@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1410"
+MTU_DEFAULT="1415"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -894,6 +894,19 @@ xfrm_policy_install_tunnel_ips() {
   # others only accept "mark <val>".
   _xfrm_pol_del() {
     local dir="$1" src="$2" dst="$3"
+
+    # Delete by index for ANY policy matching dir/src/dst (regardless of mark/mask/template).
+    # This avoids "File exists" collisions caused by stale/incorrect policies.
+    while read -r _idx; do
+      [ -n "${_idx}" ] || continue
+      ip xfrm policy delete index "${_idx}" 2>/dev/null || true
+    done < <(
+      ip -o xfrm policy 2>/dev/null | awk -v d="${dir}" -v s="${src}" -v t="${dst}" '
+        $0 ~ ("dir " d) && $0 ~ ("src " s) && $0 ~ ("dst " t) {
+          for (i=1;i<=NF;i++) if ($i=="index") print $(i+1)
+        }'
+    )
+
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
@@ -1256,6 +1269,15 @@ xfrm_policy_install_tunnel_ips() {
   # others only accept "mark <val>".
   _xfrm_pol_del() {
     local dir="$1" src="$2" dst="$3"
+    # Delete by index for ANY policy matching dir/src/dst (regardless of mark/mask/template).
+    while read -r _idx; do
+      [ -n "${_idx}" ] || continue
+      ip xfrm policy delete index "${_idx}" 2>/dev/null || true
+    done < <(ip -o xfrm policy 2>/dev/null | awk -v d="$dir" -v s="$src" -v t="$dst" '
+      $0 ~ ("dir " d) && $0 ~ ("src " s) && $0 ~ ("dst " t) {
+        for (i=1;i<=NF;i++) if ($i=="index") print $(i+1)
+      }
+    ')
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${mh}" 2>/dev/null || true
     ip xfrm policy delete src "${src}" dst "${dst}" dir "${dir}" mark "${md}" 2>/dev/null || true
