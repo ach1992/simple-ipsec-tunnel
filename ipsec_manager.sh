@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1415"
+MTU_DEFAULT="1380"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -764,41 +764,11 @@ ensure_vti() {
 }
 
 ensure_tunnel_routes() {
-  # Minimal + safe scaffolding:
-  # - Ensure we have an ip rule for this MARK to lookup TABLE
-  # - Ensure the connected /30 exists in that TABLE (does NOT change default routes)
-  local md subnet
-  md="$(mark_dec)"
-  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
-
-  # rule preference must exist; if not present in conf (older installs), derive from MARK
-  if [[ -z "${RULE_PREF:-}" ]]; then
-    RULE_PREF="$md"
-    (( RULE_PREF < 10000 )) && RULE_PREF=$((10000 + RULE_PREF))
-  fi
-
-  # Add rule if missing
-  if ! ip -4 rule show 2>/dev/null | awk -v p="${RULE_PREF}" -v m="${md}" -v t="${TABLE}" '
-      $1==(p":") && $0~("fwmark "m) && $0~(" lookup "t) {found=1}
-      END{exit(found?0:1)}
-    '; then
-    ip -4 rule add pref "${RULE_PREF}" fwmark "${md}/0xffffffff" lookup "${TABLE}" 2>/dev/null || true
-  fi
-
-  # Ensure the connected subnet exists in the table (idempotent)
-  ip -4 route replace table "${TABLE}" "${subnet}" dev "${TUN_NAME}" src "$(local_tun_ip)" 2>/dev/null || true
-  ip route flush cache >/dev/null 2>&1 || true
+  true
 }
 
 ensure_mangle_mark_rules() {
-  # Minimal marking rules (safe):
-  # - Mark packets towards remote tunnel IP so they consistently use the correct policy routing if needed
-  # - Mark packets arriving from the VTI to keep reply routing consistent
-  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || \
-    iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff"
-
-  iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || \
-    iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
+  true
 }
 
 # ------ XFRM helpers --------
@@ -1192,7 +1162,7 @@ local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 print_header() {
   echo -e "${BOLD}============================================================${NC}"
-  echo -e "${BOLD} Force fix policies${NC}  ${DIM}(no logic change, cleaner output)${NC}"
+  echo -e "${BOLD} Force fix policies${NC}"
   echo -e "${BOLD}------------------------------------------------------------${NC}"
   echo -e "${BOLD} Tunnel:${NC} ${tun}"
   echo -e "${BOLD} Public:${NC} ${LOCAL_WAN_IP}  <->  ${REMOTE_WAN_IP}"
