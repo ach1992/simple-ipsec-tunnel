@@ -25,7 +25,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1378"
+MTU_DEFAULT="1375"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -733,28 +733,23 @@ ensure_vti() {
 # ensure_mangle_mark_rules() { true; }
 
 ensure_tunnel_routes() {
-  # route for the /30 and remote tunnel IP in per-tunnel routing table
-  local subnet
-  subnet="$(echo "${TUN_LOCAL_CIDR%/*}" | awk -F. '{print $1"."$2"."$3".0/30"}')"
-  ip -4 route replace table "${TABLE}" "${subnet}" dev "${TUN_NAME}" scope link 2>/dev/null || true
-  ip -4 route replace table "${TABLE}" "${TUN_REMOTE_IP}/32" dev "${TUN_NAME}" scope link 2>/dev/null || true
-  ip route flush cache >/dev/null 2>&1 || true
+  # Only make the tunnel endpoint reachable via the VTI itself.
+  # This is the safest mode for "just tunnel IP <-> tunnel IP" and works for multi tunnels too.
+  local lip rip
+  lip="$(local_tun_ip)"
+  rip="${TUN_REMOTE_IP}"
+
+  # Route remote tunnel IP via VTI; force source to local tunnel IP
+  ip -4 route replace "${rip}/32" dev "${TUN_NAME}" src "${lip}" 2>/dev/null || true
+
+  # Some kernels need an explicit scope link for point-to-point behavior
+  # (harmless if not needed)
+  ip -4 route replace "${rip}/32" dev "${TUN_NAME}" scope link src "${lip}" 2>/dev/null || true
 }
 
 ensure_mangle_mark_rules() {
-  # SAFE marking: only mark traffic to remote tunnel endpoint IP
-  local md
-  md="$(mark_to_dec "${MARK}")"
-
-  iptables -t mangle -C OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || \
-    iptables -t mangle -A OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff"
-
-  # Mark inbound packets arriving from the tunnel (so replies follow same table if needed)
-  iptables -t mangle -C PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || \
-    iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff"
-
-  # ip rule (stable preference already computed as RULE_PREF)
-  ip rule add pref "${RULE_PREF}" fwmark "${md}" table "${TABLE}" 2>/dev/null || true
+  # Not needed for "only tunnel IP" mode.
+  true
 }
 
 mark_hex_from_conf() {
@@ -890,7 +885,12 @@ if ! wait_for_xfrm_state; then
   exit 1
 fi
 
-xfrm_policy_install_tunnel_ips
+# Try ping first; if it fails, reinstall policies once.
+if ! ping -c 1 -W 1 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+  warn "Ping failed right after SA up; reinstalling XFRM endpoint policies..."
+  xfrm_policy_install_tunnel_ips
+fi
+
 log "Tunnel is up (XFRM state present for MARK)."
 EOF
 
@@ -960,10 +960,46 @@ cleanup_firewall_rules() {
 }
 
 cleanup_iptables_mangle_rules() {
-  local md
-  md="$(mark_to_dec "${MARK}")"
-  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || true
-  iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${md}/0xffffffff" 2>/dev/null || true
+  local line
+  while true; do
+    line="$(
+      iptables -t mangle -S OUTPUT 2>/dev/null |
+        grep -E -- "^-A OUTPUT\b.*\b-d ${TUN_REMOTE_IP}(/32)?\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(
+      iptables -t mangle -S OUTPUT 2>/dev/null |
+        grep -E -- "^-A OUTPUT\b.*\b-o ${TUN_NAME}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(
+      iptables -t mangle -S PREROUTING 2>/dev/null |
+        grep -E -- "^-A PREROUTING\b.*\b-i ${TUN_NAME}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(
+      iptables -t mangle -S POSTROUTING 2>/dev/null |
+        grep -E -- "^-A POSTROUTING\b.*\b-o ${TUN_NAME}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
 }
 
 cleanup_xfrm_policies() {
@@ -1462,16 +1498,33 @@ apply_tunnel_files_and_service() {
 iptables_delete_all_marks_for_if() {
   local ifc="$1"
   local line
-
   while true; do
-    line="$(iptables -t mangle -S OUTPUT 2>/dev/null | grep -E -- "-o ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
-    [[ -z "$line" ]] && break
+    line="$(
+      iptables -t mangle -S OUTPUT 2>/dev/null |
+        grep -E -- "^-A OUTPUT\b.*\b-o ${ifc}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
     iptables -t mangle ${line/-A /-D } 2>/dev/null || true
   done
 
   while true; do
-    line="$(iptables -t mangle -S PREROUTING 2>/dev/null | grep -E -- "-i ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
-    [[ -z "$line" ]] && break
+    line="$(
+      iptables -t mangle -S PREROUTING 2>/dev/null |
+        grep -E -- "^-A PREROUTING\b.*\b-i ${ifc}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(
+      iptables -t mangle -S POSTROUTING 2>/dev/null |
+        grep -E -- "^-A POSTROUTING\b.*\b-o ${ifc}\b.*\b-j (MARK|CONNMARK)\b" |
+        head -n1
+    )"
+    [[ -z "${line:-}" ]] && break
     iptables -t mangle ${line/-A /-D } 2>/dev/null || true
   done
 }
