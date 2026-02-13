@@ -4,6 +4,12 @@ set -Eeuo pipefail
 # ============================================================
 #  Simple IPsec Tunnel (IKEv2 + VTI) - Multi Tunnel Manager
 #  Optimized for Debian/Ubuntu (multiple versions)
+#
+#  Key points:
+#   - Auto-fix tunnel ping: installs XFRM policies for tunnel IPs using REAL mark from xfrm state
+#   - Idempotent: no duplicate ip rules/routes/iptables rules
+#   - Full cleanup on delete/stop: xfrm policies + ip rules/routes + iptables + interface
+#   - Robust interactive UX: invalid inputs never exit the script; loops everywhere
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -25,7 +31,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1376"
+MTU_DEFAULT="1436"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -76,11 +82,11 @@ require_cmds() {
     have_cmd "$c" || missing+=("$c")
   done
   have_cmd ipsec || missing+=("strongswan (ipsec)")
-  have_cmd iptables || missing+=("iptables")
+											
   if ((${#missing[@]})); then
     err "Missing required commands: ${missing[*]}"
     err "Debian/Ubuntu install:"
-    err "  apt-get update && apt-get install -y strongswan iproute2 iputils-ping iptables"
+    err "  apt-get update && apt-get install -y strongswan iproute2 iputils-ping"
     exit 1
   fi
 }
