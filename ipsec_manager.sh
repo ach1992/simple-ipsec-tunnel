@@ -444,8 +444,9 @@ conn ${conn_name}
   ike=aes256gcm16-sha256-modp2048,aes256-sha256-modp2048
   esp=aes256gcm16-sha256,aes256-sha256
 
-  dpd:contentReference[oaicite:10]{index=10}
+  dpdaction=restart
   dpddelay=30s
+  dpdtimeout=120s
   keyingtries=%forever
 EOF
 
