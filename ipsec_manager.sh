@@ -25,7 +25,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1280"
+MTU_DEFAULT="1436"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -76,11 +76,11 @@ require_cmds() {
     have_cmd "$c" || missing+=("$c")
   done
   have_cmd ipsec || missing+=("strongswan (ipsec)")
-											
+  have_cmd iptables || missing+=("iptables")
   if ((${#missing[@]})); then
     err "Missing required commands: ${missing[*]}"
     err "Debian/Ubuntu install:"
-    err "  apt-get update && apt-get install -y strongswan iproute2 iputils-ping"
+    err "  apt-get update && apt-get install -y strongswan iproute2 iputils-ping iptables"
     exit 1
   fi
 }
@@ -434,6 +434,7 @@ conn ${conn_name}
   # Route-based (policy routing via mark)
   mark=${MARK}
   installpolicy=no
+  forceencaps=yes
 
   leftsubnet=0.0.0.0/0
   rightsubnet=0.0.0.0/0
@@ -443,7 +444,7 @@ conn ${conn_name}
   ike=aes256gcm16-sha256-modp2048,aes256-sha256-modp2048
   esp=aes256gcm16-sha256,aes256-sha256
 
-  dpdaction=restart
+  dpd:contentReference[oaicite:10]{index=10}
   dpddelay=30s
   keyingtries=%forever
 EOF
@@ -552,8 +553,12 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 
-TimeoutStartSec=45
+TimeoutStartSec=180
 TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=0
 
 ExecStart=/usr/local/sbin/simple-ipsec-up %i
 ExecStop=/usr/local/sbin/simple-ipsec-down %i
@@ -679,6 +684,31 @@ apply_sysctl() {
   fi
 }
 
+ensure_firewall_rules() {
+    log "Ensuring firewall rules for IPsec..."
+
+    # --- Highest Priority Rule ---
+    # Allow all traffic that is part of an already established connection.
+    # This is a standard best practice for stateful firewalls.
+    iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # --- Rules for establishing NEW connections ---
+    # Allow IKE and NAT-T for new tunnel negotiations.
+    iptables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -p udp --dport 500 -j ACCEPT
+    iptables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p udp --dport 4500 -j ACCEPT
+
+    # Allow ESP protocol for the encrypted data itself.
+    iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p esp -j ACCEPT
+
+    # --- Rules for Forwarding new traffic from the tunnel ---
+    # This allows new connections initiated from the tunnel side to pass through.
+    iptables -C FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 2 -i "${TUN_NAME}" -j ACCEPT
+    iptables -C FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || iptables -I FORWARD 3 -o "${TUN_NAME}" -j ACCEPT
+}
 
 ensure_vti() {
   local key_dec
@@ -827,6 +857,7 @@ xfrm_policy_install_tunnel_ips() {
 
 ensure_kernel_modules
 apply_sysctl
+ensure_firewall_rules
 
 if ! wait_for_local_ip; then
   err "Local public IP not present yet: ${LOCAL_WAN_IP} (network not ready)."
@@ -908,7 +939,51 @@ xfrm_state_mark_dec() {
   fi
 }
 
+cleanup_firewall_rules() {
+    # Check if any other VTI interface managed by this script exists.
+    local other_vti_exists=false
+    # Use a subshell to avoid modifying the main script's IFS or other settings
+    (
+        shopt -s nullglob
+        local conf_files=("$TUNNELS_DIR"/*.conf)
+        for conf_file in "${conf_files[@]}"; do
+            local other_tun_name
+            other_tun_name=$(basename "$conf_file" .conf)
+            # If the tunnel is not the one we are currently deleting AND its interface exists...
+            if [[ "$other_tun_name" != "$tun" ]] && ip link show "$other_tun_name" >/dev/null 2>&1; then
+                other_vti_exists=true
+                break
+            fi
+        done
+        # Exit subshell and return status via a variable that the parent can see
+        # This is a bit tricky in shell, a simple echo is easier.
+    )
+    
+    # A simpler way to check for other tunnels without complex subshells
+    local other_tunnel_count
+    other_tunnel_count=$(find "$TUNNELS_DIR" -maxdepth 1 -name "*.conf" -not -name "${tun}.conf" | wc -l)
 
+
+    # If no other tunnels are configured, we can safely remove the generic firewall rules.
+    if [[ "$other_tunnel_count" -eq 0 ]]; then
+        # Remove rules in reverse order of insertion for safety
+        # These rules are generic and should only be removed if this is the last tunnel.
+        iptables -D INPUT -p esp -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    fi
+
+    # Always remove rules specific to this tunnel's interface, regardless of other tunnels.
+    iptables -D FORWARD -i "${TUN_NAME}" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "${TUN_NAME}" -j ACCEPT 2>/dev/null || true
+}
+
+cleanup_iptables_mangle_rules() {
+  iptables -t mangle -D OUTPUT -d "${TUN_REMOTE_IP}/32" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff" 2>/dev/null || true
+}
 
 cleanup_xfrm_policies() {
   local lip rip mark_dec_effective
@@ -940,8 +1015,10 @@ cleanup_policy_routing() {
 
 ipsec down "${conn_name}" >/dev/null 2>&1 || true
 
+cleanup_firewall_rules
 cleanup_xfrm_policies
 cleanup_policy_routing
+cleanup_iptables_mangle_rules
 
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip link del "${TUN_NAME}" >/dev/null 2>&1 || true
@@ -1125,9 +1202,8 @@ enable_service() {
 
 start_or_restart_service_nb() {
   local svc; svc="$(service_for "$1")"
-  # Start/restart in background so the UI returns immediately.
-  # For oneshot units, "start" may do nothing if it is already active (exited), so prefer restart.
-  systemctl restart --no-block "$svc" >/dev/null 2>&1     || systemctl start --no-block "$svc" >/dev/null 2>&1     || true
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  systemctl restart --no-block "$svc" >/dev/null 2>&1 || systemctl start --no-block "$svc" >/dev/null 2>&1 || true
 }
 
 show_service_debug_if_failed() {
@@ -1418,11 +1494,28 @@ apply_tunnel_files_and_service() {
   ipsec_reload_all
 }
 
+iptables_delete_all_marks_for_if() {
+  local ifc="$1"
+  local line
+
+  while true; do
+    line="$(iptables -t mangle -S OUTPUT 2>/dev/null | grep -E -- "-o ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
+    [[ -z "$line" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+
+  while true; do
+    line="$(iptables -t mangle -S PREROUTING 2>/dev/null | grep -E -- "-i ${ifc}\b.*-j MARK --set-xmark" | head -n1)"
+    [[ -z "$line" ]] && break
+    iptables -t mangle ${line/-A /-D } 2>/dev/null || true
+  done
+}
 
 delete_ip_rules_for_mark_table() {
   local mark_dec="$1"
   local table="$2"
 
+  # هر rule که fwmark=mark_dec و lookup table دارد حذف می‌کنیم
   ip rule show | awk -v m="$mark_dec" -v t="$table" '
     $0 ~ ("fwmark " m) && $0 ~ (" lookup " t) {print $1}
   ' | sed 's/://' | while read -r pref; do
@@ -1463,6 +1556,7 @@ remove_tunnel_everything() {
     /usr/local/sbin/simple-ipsec-down "$tun" >/dev/null 2>&1 || true
   fi
 
+  iptables_delete_all_marks_for_if "$ifc"
 
   if [[ -n "${mark_dec:-}" ]]; then
     delete_ip_rules_for_mark_table "$mark_dec" "$table"
