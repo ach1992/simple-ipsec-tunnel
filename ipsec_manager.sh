@@ -1423,7 +1423,6 @@ delete_ip_rules_for_mark_table() {
   local mark_dec="$1"
   local table="$2"
 
-  # هر rule که fwmark=mark_dec و lookup table دارد حذف می‌کنیم
   ip rule show | awk -v m="$mark_dec" -v t="$table" '
     $0 ~ ("fwmark " m) && $0 ~ (" lookup " t) {print $1}
   ' | sed 's/://' | while read -r pref; do
