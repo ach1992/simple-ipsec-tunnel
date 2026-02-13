@@ -23,6 +23,14 @@ SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec@.service"
 UP_HELPER="/usr/local/sbin/simple-ipsec-up"
 DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
+# New: activation + healthcheck units/helpers
+ACTIVATE_SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec-activate@.service"
+ACTIVATE_TIMER_TEMPLATE="/etc/systemd/system/simple-ipsec-activate@.timer"
+HEALTH_SERVICE_TEMPLATE="/etc/systemd/system/simple-ipsec-health@.service"
+HEALTH_TIMER_TEMPLATE="/etc/systemd/system/simple-ipsec-health@.timer"
+ACTIVATE_HELPER="/usr/local/sbin/simple-ipsec-activate"
+HEALTH_HELPER="/usr/local/sbin/simple-ipsec-health"
+
 # Defaults
 TUN_NAME_DEFAULT="vti0"
 MTU_DEFAULT="1380"
@@ -38,6 +46,11 @@ ENABLE_DISABLE_POLICY_DEFAULT="no"   # risky globally; per-iface only
 SYSTEMCTL_RESTART_TIMEOUT="${SYSTEMCTL_RESTART_TIMEOUT:-180}"   # seconds
 IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"                     # seconds
 XFRM_WAIT_MAX="${XFRM_WAIT_MAX:-90}"                           # seconds
+
+# Activation/Health defaults (can override via env)
+ACTIVATE_RETRY_SEC="${ACTIVATE_RETRY_SEC:-20}"                 # activation timer interval
+ACTIVATE_INITIAL_DELAY_SEC="${ACTIVATE_INITIAL_DELAY_SEC:-10}" # first activation after create/edit
+HEALTH_INTERVAL_SEC="${HEALTH_INTERVAL_SEC:-30}"               # health timer interval
 
 # Colors
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"
@@ -164,6 +177,8 @@ conf_path_for() { echo "$TUNNELS_DIR/${1}.conf"; }
 conn_name_for() { echo "simple-ipsec-${1}"; }
 ipsec_conn_conf_for() { echo "$IPSEC_INCLUDE_DIR/${1}.conf"; }
 service_for() { echo "simple-ipsec@${1}.service"; }
+activate_timer_for() { echo "simple-ipsec-activate@${1}.timer"; }
+health_timer_for() { echo "simple-ipsec-health@${1}.timer"; }
 
 # -----------------------
 # Tunnel list / choose
@@ -587,6 +602,64 @@ WantedBy=multi-user.target
 EOF
 
   # -----------------------
+  # ACTIVATE: tries to start tunnel after create/edit, without making the manager do it inline
+  # -----------------------
+  cat >"$ACTIVATE_SERVICE_TEMPLATE" <<'EOF'
+[Unit]
+Description=Simple IPsec Tunnel - Activation helper (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simple-ipsec-activate %i
+EOF
+
+  cat >"$ACTIVATE_TIMER_TEMPLATE" <<EOF
+[Unit]
+Description=Simple IPsec Tunnel - Activation timer (%i)
+
+[Timer]
+OnBootSec=${ACTIVATE_INITIAL_DELAY_SEC}
+OnUnitActiveSec=${ACTIVATE_RETRY_SEC}
+AccuracySec=1s
+RandomizedDelaySec=2s
+Unit=simple-ipsec-activate@%i.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # -----------------------
+  # HEALTH: periodic check to keep service active and ping OK; auto fix policies when ping fails
+  # -----------------------
+  cat >"$HEALTH_SERVICE_TEMPLATE" <<'EOF'
+[Unit]
+Description=Simple IPsec Tunnel - Health check (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simple-ipsec-health %i
+EOF
+
+  cat >"$HEALTH_TIMER_TEMPLATE" <<EOF
+[Unit]
+Description=Simple IPsec Tunnel - Health timer (%i)
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=${HEALTH_INTERVAL_SEC}
+AccuracySec=1s
+RandomizedDelaySec=3s
+Unit=simple-ipsec-health@%i.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # -----------------------
   # UP helper
   # -----------------------
   cat >"$UP_HELPER" <<'EOF'
@@ -758,7 +831,6 @@ mark_hex_from_conf() {
   printf "0x%x" "$md"
 }
 
-# Multi-tunnel safe: state present ONLY if mark matches this tunnel
 xfrm_state_present() {
   local mh hx
   mh="$(mark_hex_from_conf)"
@@ -796,7 +868,6 @@ start_ipsec_or_fail() {
   exit 1
 }
 
-# Read mark/reqid from the correct state block (by mark)
 xfrm_state_mark_dec() {
   local mh m
   mh="$(mark_hex_from_conf)"
@@ -1077,7 +1148,6 @@ mark_hex_from_conf() {
   printf "0x%x" "$md"
 }
 
-# ---- XFRM detection (match by MARK, tolerant to leading zeros) ----
 xfrm_state_present() {
   local mh hx re
   mh="$(mark_hex_from_conf)"
@@ -1095,7 +1165,6 @@ wait_for_xfrm_state() {
   return 1
 }
 
-# Read actual mark from state block (by mark match) - returns decimal
 xfrm_state_mark_dec() {
   local mh hx re m
   mh="$(mark_hex_from_conf)"
@@ -1113,7 +1182,6 @@ xfrm_state_mark_dec() {
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 
-# Read reqid from ESP state block (by mark)
 xfrm_reqid_from_state() {
   local mh hx re reqid
   mh="$(mark_hex_from_conf)"
@@ -1146,7 +1214,6 @@ xfrm_policy_install_tunnel_ips() {
   reqid="$(xfrm_reqid_from_state || true)"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
-  # clean old
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
@@ -1154,7 +1221,6 @@ xfrm_policy_install_tunnel_ips() {
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 
-  # add new (ping over tunnel endpoints)
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
     mark "${mark_dec_effective}" mask 0xffffffff \
     tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
@@ -1168,7 +1234,6 @@ xfrm_policy_install_tunnel_ips() {
     tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
-# Try to bring up SA, but don't fail hard (duplicate CHILD_SA can be OK)
 start_ipsec_try() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
@@ -1185,7 +1250,6 @@ start_ipsec_try() {
   return 1
 }
 
-# ---- main logic ----
 if xfrm_state_present; then
   log "XFRM state already present for MARK; reinstalling policies only."
   xfrm_policy_install_tunnel_ips
@@ -1212,7 +1276,116 @@ log "Ping test: ${TUN_REMOTE_IP}"
 ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1 && log "Ping OK." || warn "Ping failed (check SA counters: ip -s xfrm state)."
 EOF
 
-  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" || true
+  # -----------------------
+  # ACTIVATE helper
+  # - Does NOT run during create/edit
+  # - Periodically tries to start the tunnel service
+  # - If tunnel ping becomes OK, it stops the activation timer itself
+  # -----------------------
+  cat >"$ACTIVATE_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/etc/simple-ipsec"
+TUNNELS_DIR="$APP_DIR/tunnels.d"
+
+tun="${1:-}"
+[[ -n "${tun}" ]] || { echo "Usage: simple-ipsec-activate <tunnel_name>" >&2; exit 2; }
+
+CONF_FILE="$TUNNELS_DIR/${tun}.conf"
+[[ -f "$CONF_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+
+svc="simple-ipsec@${tun}.service"
+timer="simple-ipsec-activate@${tun}.timer"
+
+log()  { echo "[simple-ipsec-activate:${tun}] $*"; }
+warn() { echo "[simple-ipsec-activate:${tun}][WARN] $*" >&2; }
+
+# If already healthy, stop the activation timer.
+if systemctl is-active --quiet "$svc" 2>/dev/null; then
+  if ping -c 1 -W 1 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+    log "Tunnel healthy (service active, ping OK). Stopping activation timer."
+    systemctl stop "$timer" >/dev/null 2>&1 || true
+    systemctl disable "$timer" >/dev/null 2>&1 || true
+    exit 0
+  fi
+fi
+
+# Try start the service (peer may not be ready; service may fail; we reset-failed to allow retries)
+log "Attempting to start tunnel service (peer may not be ready yet)..."
+systemctl start "$svc" >/dev/null 2>&1 || true
+
+# If service failed, reset so next retry isn't blocked
+systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+
+# Re-check: if now healthy, stop timer
+if systemctl is-active --quiet "$svc" 2>/dev/null; then
+  if ping -c 1 -W 1 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+    log "Tunnel became healthy. Stopping activation timer."
+    systemctl stop "$timer" >/dev/null 2>&1 || true
+    systemctl disable "$timer" >/dev/null 2>&1 || true
+    exit 0
+  fi
+fi
+
+warn "Not healthy yet (will retry on next activation tick)."
+exit 0
+EOF
+
+  # -----------------------
+  # HEALTH helper
+  # - Ensures service is active
+  # - If ping fails: run fix policies (Force fix), to recover policy issues
+  # -----------------------
+  cat >"$HEALTH_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/etc/simple-ipsec"
+TUNNELS_DIR="$APP_DIR/tunnels.d"
+
+tun="${1:-}"
+[[ -n "${tun}" ]] || { echo "Usage: simple-ipsec-health <tunnel_name>" >&2; exit 2; }
+
+CONF_FILE="$TUNNELS_DIR/${tun}.conf"
+[[ -f "$CONF_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+
+svc="simple-ipsec@${tun}.service"
+
+log()  { echo "[simple-ipsec-health:${tun}] $*"; }
+warn() { echo "[simple-ipsec-health:${tun}][WARN] $*" >&2; }
+
+# 1) Ensure service active
+if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+  warn "Service is not active; starting it."
+  systemctl start "$svc" >/dev/null 2>&1 || true
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+fi
+
+# 2) Ping check (only if we have tunnel IP configured)
+if [[ -n "${TUN_REMOTE_IP:-}" ]]; then
+  if ping -c 1 -W 1 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+    log "Ping OK."
+    exit 0
+  fi
+  warn "Ping FAILED. Running force-fix policies..."
+  if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
+    /usr/local/sbin/simple-ipsec-fix "$tun" >/dev/null 2>&1 || true
+  else
+    warn "simple-ipsec-fix not found; fallback restart service."
+    systemctl restart "$svc" >/dev/null 2>&1 || true
+    systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  fi
+fi
+
+exit 0
+EOF
+
+  chmod +x "$UP_HELPER" "$DOWN_HELPER" "$FIX_HELPER" "$ACTIVATE_HELPER" "$HEALTH_HELPER" || true
   systemctl daemon-reload
 }
 
@@ -1221,25 +1394,15 @@ enable_service() {
   systemctl enable "$svc" >/dev/null 2>&1 || true
 }
 
-start_or_restart_service_nb() {
-  local svc; svc="$(service_for "$1")"
-  systemctl restart --no-block "$svc" >/dev/null 2>&1 \
-    || systemctl start --no-block "$svc" >/dev/null 2>&1 \
-    || true
+# New: enable & start timers
+enable_activation_timer() {
+  local tun="$1"
+  systemctl enable --now "$(activate_timer_for "$tun")" >/dev/null 2>&1 || true
 }
 
-show_service_debug_if_failed() {
-  local svc="$1"
-  sleep 1
-  if systemctl is-failed --quiet "$svc" 2>/dev/null; then
-    err "Service failed: $svc"
-    systemctl --no-pager --full status "$svc" || true
-    if have_cmd journalctl; then
-      echo
-      echo -e "${WHT}Recent logs:${NC}"
-      journalctl -u "$svc" -n 80 --no-pager || true
-    fi
-  fi
+enable_health_timer() {
+  local tun="$1"
+  systemctl enable --now "$(health_timer_for "$tun")" >/dev/null 2>&1 || true
 }
 
 stop_disable_service() {
@@ -1249,6 +1412,16 @@ stop_disable_service() {
   systemctl stop "$svc" >/dev/null 2>&1 || true
   systemctl disable "$svc" >/dev/null 2>&1 || true
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+}
+
+stop_disable_timers_for_tunnel() {
+  local tun="$1"
+  systemctl stop "$(activate_timer_for "$tun")" >/dev/null 2>&1 || true
+  systemctl disable "$(activate_timer_for "$tun")" >/dev/null 2>&1 || true
+  systemctl stop "$(health_timer_for "$tun")" >/dev/null 2>&1 || true
+  systemctl disable "$(health_timer_for "$tun")" >/dev/null 2>&1 || true
+  systemctl reset-failed "simple-ipsec-activate@${tun}.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "simple-ipsec-health@${tun}.service" >/dev/null 2>&1 || true
 }
 
 ipsec_reload_all() {
@@ -1498,18 +1671,21 @@ apply_tunnel_files_and_service() {
   write_ipsec_secrets_block "$tun"
   write_sysctl_persist
 
+  # IMPORTANT CHANGE:
+  # Do NOT start/restart simple-ipsec@... during create/edit.
+  # Only enable it, then activation timer will attempt start when peer is ready.
   enable_service "$tun"
 
-  log "Applying IPsec service..."
-  start_or_restart_service_nb "$tun"
-  show_service_debug_if_failed "$(service_for "$tun")"
-
-  for _ in 1 2 3; do
-    systemctl is-active --quiet "$(service_for "$tun")" && break
-    sleep 1
-  done
-
+  # Always reload ipsec configs (safe)
   ipsec_reload_all
+
+  # Enable timers:
+  # - activation timer: tries to bring tunnel up later (peer readiness)
+  # - health timer: keeps it alive and fixes policies when ping fails
+  enable_activation_timer "$tun"
+  enable_health_timer "$tun"
+
+  log "Applied config. Activation/Health timers enabled for: $tun"
 }
 
 iptables_delete_all_marks_for_if() {
@@ -1581,6 +1757,9 @@ remove_tunnel_everything() {
   if [[ -n "${MARK:-}" ]]; then
     mark_dec="$(mark_to_dec "${MARK}")"
   fi
+
+  # Stop timers first
+  stop_disable_timers_for_tunnel "$tun"
 
   stop_disable_service "$tun"
 
@@ -1655,17 +1834,19 @@ do_status_one() {
   read_conf "$tun" || { err "Config not found."; return; }
 
   echo -e "${MAG}===== Status: ${tun} =====${NC}"
-  local svc mark_hex MARK_DEC
+  local svc mark_hex MARK_DEC hx
   svc="$(service_for "$tun")"
+
   if systemctl is-active --quiet "$svc"; then
     echo -e "Service: ${GRN}active${NC}"
   else
     echo -e "Service: ${RED}inactive${NC}"
   fi
-  if ip link show "$tun" >/dev/null 2>&1; then
-    echo -e "Interface: ${GRN}present${NC}"
+
+  if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+    echo -e "Interface: ${GRN}present${NC} (${TUN_NAME})"
   else
-    echo -e "Interface: ${RED}missing${NC}"
+    echo -e "Interface: ${RED}missing${NC} (${TUN_NAME})"
   fi
 
   MARK_DEC="$(mark_to_dec "$MARK")"
@@ -1682,9 +1863,10 @@ do_status_one() {
   else
     echo -e "Ping: ${RED}FAIL${NC} (${TUN_REMOTE_IP})"
   fi
+
   echo
   echo -e "${WHT}Service:${NC}"
-  systemctl --no-pager --full status "$(service_for "$tun")" || true
+  systemctl --no-pager --full status "$svc" || true
   echo
 
   if have_cmd journalctl; then
@@ -1700,12 +1882,12 @@ do_status_one() {
   fi
 
   echo -e "${WHT}Interface:${NC}"
-  ip -d link show "$tun" 2>/dev/null || { warn "Interface '$tun' not found (service may be down)."; }
-  ip -4 addr show dev "$tun" 2>/dev/null || true
+  ip -d link show "$TUN_NAME" 2>/dev/null || { warn "Interface '$TUN_NAME' not found (service may be down)."; }
+  ip -4 addr show dev "$TUN_NAME" 2>/dev/null || true
   echo
 
   echo -e "${WHT}Counters:${NC}"
-  ip -s link show "$tun" 2>/dev/null || true
+  ip -s link show "$TUN_NAME" 2>/dev/null || true
   echo
 
   echo -e "${WHT}IPsec status (top):${NC}"
@@ -1716,7 +1898,7 @@ do_status_one() {
   if ping -c 3 -W 2 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
     ok "Ping OK."
   else
-    warn "Ping failed. (If SA is up but bytes=0, XFRM policy auto-fix should solve it; try restart service.)"
+    warn "Ping failed. (Health-check will auto fix policies if needed.)"
   fi
 }
 
@@ -1728,7 +1910,7 @@ do_status_all() {
     any="yes"
     echo -e "${CYA}--- ${t} ---${NC}"
     if read_conf "$t"; then
-      local svc mark_hex MARK_DEC
+      local svc mark_hex MARK_DEC hx
       svc="$(service_for "$t")"
 
       if systemctl is-active --quiet "$svc"; then
@@ -1737,10 +1919,10 @@ do_status_all() {
         echo -e "Service: ${RED}inactive${NC}"
       fi
 
-      if ip link show "$t" >/dev/null 2>&1; then
-        echo -e "Interface: ${GRN}present${NC}"
+      if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        echo -e "Interface: ${GRN}present${NC} (${TUN_NAME})"
       else
-        echo -e "Interface: ${RED}missing${NC}"
+        echo -e "Interface: ${RED}missing${NC} (${TUN_NAME})"
       fi
 
       MARK_DEC="$(mark_to_dec "$MARK")"
@@ -1824,6 +2006,7 @@ do_create() {
   with_lock apply_tunnel_files_and_service "$TUN_NAME"
 
   ok "Tunnel '${TUN_NAME}' created & applied."
+  warn "Note: service is NOT started immediately. Activation timer will start it when peer is ready."
   echo
   echo -e "${GRN}Tunnel addressing:${NC}"
   echo "  PAIR_CODE:         ${PAIR_CODE}"
@@ -1869,12 +2052,15 @@ do_edit() {
     warn "Renaming tunnel: ${old_tun} -> ${TUN_NAME}"
     with_lock remove_tunnel_everything "$old_tun"
   else
+    # IMPORTANT: do not start/stop inline; just stop service to avoid using old settings mid-edit
     with_lock stop_disable_service "$old_tun" >/dev/null 2>&1 || true
+    with_lock stop_disable_timers_for_tunnel "$old_tun" >/dev/null 2>&1 || true
   fi
 
   with_lock apply_tunnel_files_and_service "$TUN_NAME"
 
   ok "Tunnel updated & applied: ${TUN_NAME}"
+  warn "Note: service is NOT started immediately. Activation timer will start it when peer is ready."
   echo
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   warn "COPY BLOCK includes PSK. Keep it private."
@@ -1948,8 +2134,8 @@ menu() {
     echo -e "${CYA}3)${NC} Status (one tunnel)"
     echo -e "${CYA}4)${NC} Status (ALL tunnels)"
     echo -e "${CYA}5)${NC} Info / COPY BLOCK (one tunnel)"
-    echo -e "${CYA}6)${NC} Force fix policies (one tunnel)"
-    echo -e "${CYA}7)${NC} Force fix policies (ALL tunnels)"
+    echo -e "${CYA}6)${NC} Fix policies (one tunnel)"
+    echo -e "${CYA}7)${NC} Fix policies (ALL tunnels)"
     echo -e "${CYA}8)${NC} List tunnels"
     echo -e "${CYA}9)${NC} Delete tunnel"
     echo -e "${CYA}0)${NC} Exit"
