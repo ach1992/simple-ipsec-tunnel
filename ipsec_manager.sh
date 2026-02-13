@@ -904,6 +904,17 @@ xfrm_policy_install_tunnel_ips() {
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
     mark "${md}" mask 0xffffffff \
     tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+# Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
+# early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
+# other traffic, since selectors are strict /32 tunnel endpoint IPs.
+ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
+  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
+  tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
+  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 start_ipsec_or_fail() {
@@ -1175,6 +1186,18 @@ wait_for_xfrm_state() {
     sleep 1
   done
   return 1
+
+# Also add the same policies WITHOUT mark (some kernels do not apply fwmark to locally-generated traffic
+# early enough for marked XFRM policy lookup). This keeps ping/healthchecks reliable without affecting
+# other traffic, since selectors are strict /32 tunnel endpoint IPs.
+ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
+  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+ip xfrm policy add src "${rip}/32" dst "${lip}/32" dir in \
+  tmpl src "${REMOTE_WAN_IP}" dst "${LOCAL_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
+
+ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir fwd \
+  tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
 xfrm_reqid_from_state() {
@@ -1299,7 +1322,7 @@ ip xfrm policy 2>/dev/null | awk -v a="$(local_tun_ip)" -v b="${TUN_REMOTE_IP}" 
 # Step 5) Ping test
 echo
 info "Ping test: ${TUN_REMOTE_IP}"
-if ping -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
+if ping -I "${TUN_NAME}" -c 3 -W 2 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
   ok "Ping: OK"
 else
   bad "Ping: FAIL"
