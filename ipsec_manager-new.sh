@@ -1355,26 +1355,35 @@ CONF_FILE="$TUNNELS_DIR/${tun}.conf"
 source "$CONF_FILE"
 
 svc="simple-ipsec@${tun}.service"
+fix_helper="/usr/local/sbin/simple-ipsec-fix"
 
 log()  { echo "[simple-ipsec-health:${tun}] $*"; }
 warn() { echo "[simple-ipsec-health:${tun}][WARN] $*" >&2; }
 
-# 1) Ensure service active
+# Per-tunnel lock (avoid race with activate/up/fix)
+lock="/run/simple-ipsec-${tun}.lock"
+mkdir -p /run 2>/dev/null || true
+exec 9>"$lock"
+flock -n 9 || { warn "Another operation is running for this tunnel; skipping this tick."; exit 0; }
+
+# 1) If service is not active: start it and exit (NO FIX in same run)
 if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-  warn "Service is not active; starting it."
+  warn "Service is not active; starting it (no fix on this tick)."
   systemctl start "$svc" >/dev/null 2>&1 || true
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  exit 0
 fi
 
-# 2) Ping check (only if we have tunnel IP configured)
+# 2) Ping check (only if configured)
 if [[ -n "${TUN_REMOTE_IP:-}" ]]; then
   if ping -c 1 -W 1 "${TUN_REMOTE_IP}" >/dev/null 2>&1; then
     log "Ping OK."
     exit 0
   fi
-  warn "Ping FAILED. Running force-fix policies..."
-  if [[ -x /usr/local/sbin/simple-ipsec-fix ]]; then
-    /usr/local/sbin/simple-ipsec-fix "$tun" >/dev/null 2>&1 || true
+
+  warn "Ping FAILED while service active. Running force-fix policies..."
+  if [[ -x "$fix_helper" ]]; then
+    "$fix_helper" "$tun" >/dev/null 2>&1 || true
   else
     warn "simple-ipsec-fix not found; fallback restart service."
     systemctl restart "$svc" >/dev/null 2>&1 || true
