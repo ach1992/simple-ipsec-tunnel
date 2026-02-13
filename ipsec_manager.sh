@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1380"
+MTU_DEFAULT="1375"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -473,7 +473,7 @@ conn ${conn_name}
   rightid=${right_id}
 
   # Route-based (policy routing via mark)
-  mark=${MARK}/0xffffffff
+  mark=${MARK}
   installpolicy=no
 
   # Unique selectors (prevents duplicate CHILD_SA across multiple tunnels)
@@ -487,7 +487,6 @@ conn ${conn_name}
   # Dead Peer Detection (stability on unstable networks)
   dpdaction=restart
   dpddelay=30s
-  dpdtimeout=120s
   keyingtries=%forever
 EOF
 
