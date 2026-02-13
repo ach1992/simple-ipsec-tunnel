@@ -25,7 +25,7 @@ DOWN_HELPER="/usr/local/sbin/simple-ipsec-down"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1388"
+MTU_DEFAULT="1375"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -923,7 +923,7 @@ local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 mark_hex_from_conf() {
   local md
   md="$(mark_to_dec "${MARK}")"
-  printf "0x%08x" "$md"
+  printf "0x%x" "$md"
 }
 
 xfrm_state_mark_dec() {
@@ -1077,10 +1077,13 @@ mark_hex_from_conf() {
   printf "0x%08x" "$md"
 }
 
+# ---- XFRM detection (match by MARK, tolerant to leading zeros) ----
 xfrm_state_present() {
-  local mh
+  local mh hx re
   mh="$(mark_hex_from_conf)"
-  ip xfrm state 2>/dev/null | grep -q "mark ${mh}/0xffffffff"
+  hx="${mh#0x}"
+  re="mark 0x0*${hx}/0xffffffff"
+  ip xfrm state 2>/dev/null | grep -Eqi "$re"
 }
 
 wait_for_xfrm_state() {
@@ -1092,19 +1095,25 @@ wait_for_xfrm_state() {
   return 1
 }
 
+# Read actual mark from state block (by mark match) - returns decimal
 xfrm_state_mark_dec() {
-  local mh m
+  local mh hx re m
   mh="$(mark_hex_from_conf)"
-  m="$(ip xfrm state 2>/dev/null | awk -v mh="${mh}" '
+  hx="${mh#0x}"
+  re="^0x0*${hx}/0xffffffff$"
+
+  m="$(ip xfrm state 2>/dev/null | awk -v re="${re}" '
     $1=="src" {inblk=1}
-    inblk && $1=="mark" && $2 ~ mh {print $2; exit}
+    inblk && $1=="mark" && $2 ~ re {print $2; exit}
     inblk && /^$/ {inblk=0}
   ' | head -n1)"
+
   [[ -n "${m:-}" ]] || return 0
   m="${m%%/*}"
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 
+# Read reqid from ESP state block (by mark)
 xfrm_reqid_from_state() {
   local mh hx re reqid
   mh="$(mark_hex_from_conf)"
@@ -1137,6 +1146,7 @@ xfrm_policy_install_tunnel_ips() {
   reqid="$(xfrm_reqid_from_state || true)"
   [[ -n "${reqid:-}" ]] || reqid="1"
 
+  # clean old
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir out mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd mark "${mark_dec_effective}" mask 0xffffffff 2>/dev/null || true
@@ -1144,6 +1154,7 @@ xfrm_policy_install_tunnel_ips() {
   ip xfrm policy delete src "${rip}/32" dst "${lip}/32" dir in  2>/dev/null || true
   ip xfrm policy delete src "${lip}/32" dst "${rip}/32" dir fwd 2>/dev/null || true
 
+  # add new (ping over tunnel endpoints)
   ip xfrm policy add src "${lip}/32" dst "${rip}/32" dir out \
     mark "${mark_dec_effective}" mask 0xffffffff \
     tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
@@ -1157,7 +1168,8 @@ xfrm_policy_install_tunnel_ips() {
     tmpl src "${LOCAL_WAN_IP}"  dst "${REMOTE_WAN_IP}" proto esp reqid "${reqid}" mode tunnel 2>/dev/null || true
 }
 
-start_ipsec_or_fail() {
+# Try to bring up SA, but don't fail hard (duplicate CHILD_SA can be OK)
+start_ipsec_try() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
 
@@ -1167,24 +1179,29 @@ start_ipsec_or_fail() {
     if timeout "${IPSEC_UP_TIMEOUT}" ipsec up "${conn_name}"; then
       return 0
     fi
-    warn "ipsec up failed (try ${i})."
+    warn "ipsec up failed (try ${i}). (duplicate CHILD_SA may be OK if SA already exists)"
     sleep 1
   done
-  err "IPsec did not come up."
-  timeout 8 ipsec statusall | sed -n '1,160p' || true
-  exit 1
+  return 1
 }
 
+# ---- main logic ----
 if xfrm_state_present; then
-  log "XFRM state already present for MARK; skipping ipsec up and only reinstalling policies."
+  log "XFRM state already present for MARK; reinstalling policies only."
   xfrm_policy_install_tunnel_ips
   exit 0
 fi
 
-start_ipsec_or_fail
+start_ipsec_try || warn "ipsec up did not succeed; checking if XFRM state exists anyway..."
+
 if ! wait_for_xfrm_state; then
   err "No XFRM state found for this MARK; tunnel not established."
+  echo
+  warn "ip xfrm state:"
   ip xfrm state 2>/dev/null || true
+  echo
+  warn "ipsec statusall (top):"
+  timeout 8 ipsec statusall | sed -n '1,160p' || true
   exit 1
 fi
 
