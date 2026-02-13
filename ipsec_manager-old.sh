@@ -1908,7 +1908,7 @@ do_delete() {
 
 banner() {
   echo -e "${MAG}========================================${NC}"
-  echo -e "${WHT}  ${APP_NAME}${NC}  ${CYA}(IKEv2 + VTI | Multi Tunnel)${NC}"
+  echo -e "${WHT}  ${APP_NAME}${NC}  ${CYA}(IKEv2 + VTI | Old)${NC}"
   echo -e "${YEL}  Repo:${NC} ${BLU}${REPO_URL}${NC}"
   echo -e "${MAG}========================================${NC}"
 }
