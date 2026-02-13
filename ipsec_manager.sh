@@ -29,7 +29,7 @@ MONITOR_TIMER="/etc/systemd/system/simple-ipsec-monitor.timer"
 
 # Defaults
 TUN_NAME_DEFAULT="vti0"
-MTU_DEFAULT="1385"
+MTU_DEFAULT="1436"
 MARK_MIN=10
 MARK_MAX=999999
 TABLE_DEFAULT="220"
@@ -619,7 +619,7 @@ set -Eeuo pipefail
 # - Install XFRM policies for tunnel endpoint ping (scoped by MARK + reqid)
 # - Optionally add minimal policy-routing scaffolding (safe defaults)
 
-IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-12}"          # seconds per try
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"          # seconds per try
 IPSEC_UP_TRIES="${IPSEC_UP_TRIES:-2}"              # retries
 WAIT_LOCAL_IP_MAX="${WAIT_LOCAL_IP_MAX:-15}"        # seconds
 XFRM_STATE_WAIT="${XFRM_STATE_WAIT:-8}"             # seconds
@@ -647,7 +647,7 @@ mark_to_dec() {
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 mark_dec() { mark_to_dec "${MARK}"; }
-mark_hex() { printf "0x%08x" "$(mark_dec)"; }
+mark_hex() { printf "0x%x" "$(mark_dec)"; }
 
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
@@ -796,27 +796,49 @@ ensure_mangle_mark_rules() {
     iptables -t mangle -A PREROUTING -i "${TUN_NAME}" -j MARK --set-xmark "${MARK}/0xffffffff"
 }
 
-# -------- XFRM helpers (multi-tunnel safe: filter by MARK) --------
+# ------ XFRM helpers --------
+ipsec_child_installed() {
+  # True if strongSwan reports the CHILD_SA for this connection is INSTALLED.
+  # This is more reliable than relying on kernel 'mark' being shown in xfrm state.
+  ipsec statusall 2>/dev/null | grep -qE "^${conn_name}\{[0-9]+\}:\s+.*\bINSTALLED\b"
+}
+
 xfrm_state_present() {
   local mh
   mh="$(mark_hex)"
-  ip xfrm state 2>/dev/null | awk -v m="${mh}" -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
-    function flush() {
-      if (want && mark==m) { found=1 }
-    }
+
+  # Some kernels/strongSwan builds do NOT show the mark in `ip xfrm state`.
+  # If marks are visible, use strict (MARK-scoped) matching:
+  if ip xfrm state 2>/dev/null | grep -qE "^\s*mark\s+${mh}"; then
+    ip xfrm state 2>/dev/null | awk -v m="${mh}" -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
+      function flush() {
+        if (want && mark==m) { found=1 }
+      }
+      $1=="src" && $3=="dst" {
+        flush()
+        src=$2; dst=$4; mark=""
+        want = ((src==a && dst==b) || (src==b && dst==a)) ? 1 : 0
+        next
+      }
+      $1=="mark" {
+        mark=$2; sub(/\/.*/, "", mark)
+        next
+      }
+      END { flush(); exit(found?0:1) }
+    '
+    return $?
+  fi
+
+  # Fallback: match by public endpoint pair only (safe for your common case: different peers).
+  ip xfrm state 2>/dev/null | awk -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
     $1=="src" && $3=="dst" {
-      flush()
-      src=$2; dst=$4; mark=""
-      want = ((src==a && dst==b) || (src==b && dst==a)) ? 1 : 0
-      next
+      src=$2; dst=$4
+      if ((src==a && dst==b) || (src==b && dst==a)) { found=1 }
     }
-    $1=="mark" {
-      mark=$2; sub(/\/.*/, "", mark)
-      next
-    }
-    END { flush(); exit(found?0:1) }
+    END { exit(found?0:1) }
   '
 }
+
 
 wait_for_xfrm_state() {
   local i
@@ -888,23 +910,37 @@ start_ipsec_or_fail() {
   ipsec rereadsecrets >/dev/null 2>&1 || true
   ipsec reload >/dev/null 2>&1 || true
 
-  local i
+  local i rc
   for i in $(seq 1 "${IPSEC_UP_TRIES}"); do
     log "Bringing up IPsec: ${conn_name} (try ${i}/${IPSEC_UP_TRIES})..."
+    rc=0
     if timeout "${IPSEC_UP_TIMEOUT}" ipsec up "${conn_name}"; then
       return 0
+    else
+      rc=$?
     fi
 
-    # Multi-tunnel safe tolerance:
-    # If IPsec says "failed" but the XFRM state for THIS tunnel MARK exists, consider it up.
-    if xfrm_state_present; then
-      warn "ipsec up reported failure, but XFRM state for mark=$(mark_hex) is present. Continuing."
+    # Tolerate slow/stalled CLI: timeout may fire even though SA comes up shortly after.
+    if ipsec_child_installed; then
+      warn "ipsec up returned rc=${rc}, but strongSwan reports CHILD_SA INSTALLED. Continuing."
       return 0
     fi
 
-    warn "ipsec up failed (try ${i})."
+    # If kernel state is present (mark-based or endpoint-based fallback), consider it up.
+    if xfrm_state_present; then
+      warn "ipsec up returned rc=${rc}, but XFRM state is present. Continuing."
+      return 0
+    fi
+
+    warn "ipsec up failed (try ${i}, rc=${rc})."
     sleep 1
   done
+
+  # Final grace check (sometimes comes up right after the last try)
+  if ipsec_child_installed || xfrm_state_present; then
+    warn "IPsec reported failure, but tunnel appears up after retries. Continuing."
+    return 0
+  fi
 
   err "IPsec did not come up."
   echo
@@ -912,6 +948,7 @@ start_ipsec_or_fail() {
   timeout 8 ipsec statusall | sed -n '1,140p' || true
   exit 1
 }
+
 
 ensure_kernel_modules
 apply_sysctl
@@ -930,14 +967,23 @@ ensure_strongswan_running_and_healthy
 start_ipsec_or_fail
 
 if ! wait_for_xfrm_state; then
-  err "No XFRM state found for mark=$(mark_hex) after IPsec up. Tunnel is not established."
-  echo
-  warn "ip xfrm state (filtered):"
-  ip xfrm state 2>/dev/null | grep -n "mark $(mark_hex)" || true
-  echo
-  warn "ipsec statusall (top):"
-  timeout 8 ipsec statusall | sed -n '1,140p' || true
-  exit 1
+  # On some systems the MARK is not shown in `ip xfrm state` even though the SA is up.
+  # If strongSwan reports the CHILD_SA as INSTALLED, consider the tunnel up and continue.
+  if ipsec_child_installed; then
+    warn "XFRM state MARK not detected, but strongSwan reports CHILD_SA INSTALLED. Continuing."
+  else
+    err "No XFRM state detected after IPsec up. Tunnel is not established."
+    echo
+    warn "ip xfrm state (filtered by endpoints):"
+    ip xfrm state 2>/dev/null | awk -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
+      $1=="src" && $3=="dst" { src=$2; dst=$4; show=((src==a && dst==b)||(src==b && dst==a)) }
+      show { print }
+    ' || true
+    echo
+    warn "ipsec statusall (top):"
+    timeout 8 ipsec statusall | sed -n '1,140p' || true
+    exit 1
+  fi
 fi
 
 xfrm_policy_install_tunnel_ips
@@ -1053,7 +1099,7 @@ EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-12}"
+IPSEC_UP_TIMEOUT="${IPSEC_UP_TIMEOUT:-60}"
 IPSEC_UP_TRIES="${IPSEC_UP_TRIES:-2}"
 XFRM_STATE_WAIT="${XFRM_STATE_WAIT:-8}"
 
@@ -1070,6 +1116,10 @@ source "$CONF_FILE"
 
 conn_name="simple-ipsec-${tun}"
 
+ipsec_child_installed() {
+  ipsec statusall 2>/dev/null | grep -qE "^${conn_name}\{[0-9]+\}:\s+.*\bINSTALLED\b"
+}
+
 # --- UI helpers ---
 BOLD="[1m"; DIM="[2m"; GRN="[0;32m"; RED="[0;31m"; YEL="[0;33m"; CYA="[0;36m"; NC="[0m"
 ok()   { echo -e "  ${GRN}✔${NC} $*"; }
@@ -1082,7 +1132,7 @@ mark_to_dec() {
   if [[ "$m" =~ ^0x ]]; then echo $((16#${m#0x})); else echo "$m"; fi
 }
 mark_dec() { mark_to_dec "${MARK}"; }
-mark_hex() { printf "0x%08x" "$(mark_dec)"; }
+mark_hex() { printf "0x%x" "$(mark_dec)"; }
 local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 print_header() {
@@ -1100,18 +1150,21 @@ print_header() {
 xfrm_state_present() {
   local mh
   mh="$(mark_hex)"
-  ip xfrm state 2>/dev/null | awk -v m="${mh}" -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
-    function flush() {
-      if (want && mark==m) { found=1 }
-    }
-    $1=="src" && $3=="dst" {
-      flush()
-      src=$2; dst=$4; mark=""
-      want = ((src==a && dst==b) || (src==b && dst==a)) ? 1 : 0
-      next
-    }
-    $1=="mark" { mark=$2; sub(/\/.*/, "", mark); next }
-    END { flush(); exit(found?0:1) }
+
+  if ip xfrm state 2>/dev/null | grep -qE "^\s*mark\s+${mh}"; then
+    ip xfrm state 2>/dev/null | awk -v m="${mh}" -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
+      function flush() { if (want && mark==m) { found=1 } }
+      $1=="src" && $3=="dst" { flush(); src=$2; dst=$4; mark=""; want=((src==a && dst==b)||(src==b && dst==a))?1:0; next }
+      $1=="mark" { mark=$2; sub(/\/.*/, "", mark); next }
+      END { flush(); exit(found?0:1) }
+    '
+    return $?
+  fi
+
+  # Fallback for kernels/builds that don't show marks in state
+  ip xfrm state 2>/dev/null | awk -v a="${LOCAL_WAN_IP}" -v b="${REMOTE_WAN_IP}" '
+    $1=="src" && $3=="dst" { src=$2; dst=$4; if ((src==a && dst==b)||(src==b && dst==a)) { found=1 } }
+    END { exit(found?0:1) }
   '
 }
 
@@ -1194,9 +1247,15 @@ start_ipsec_or_fail() {
       return 0
     fi
 
+    # Tolerate slow/timeout CLI: command may time out even though SA is established.
+    if ipsec_child_installed; then
+      warn "ipsec up returned non-zero (rc=${rc}), but strongSwan reports CHILD_SA INSTALLED. Continuing."
+      return 0
+    fi
+
     # Tolerate duplicate/already-up if the correct XFRM state exists
     if xfrm_state_present; then
-      warn "ipsec up returned non-zero, but XFRM state for mark=$(mark_hex) exists. Continuing."
+      warn "ipsec up returned non-zero (rc=${rc}), but XFRM state exists. Continuing."
       return 0
     fi
 
@@ -1288,7 +1347,7 @@ mark_to_dec() {
 mark_hex_from_mark() {
   local md
   md="$(mark_to_dec "$1")"
-  printf "0x%08x" "$md"
+  printf "0x%x" "$md"
 }
 
 xfrm_present_for() {
@@ -1841,7 +1900,7 @@ do_status_one() {
   fi
 
   MARK_DEC="$(mark_to_dec "$MARK")"
-  mark_hex=$(printf "0x%08x" "$MARK_DEC")
+  mark_hex=$(printf "0x%x" "$MARK_DEC")
 
   if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
     echo -e "XFRM state: ${GRN}present${NC}"
@@ -1920,7 +1979,7 @@ do_status_all() {
 
       # XFRM state for this tunnel mark
       MARK_DEC="$(mark_to_dec "$MARK")"
-      mark_hex=$(printf "0x%08x" "$MARK_DEC")
+      mark_hex=$(printf "0x%x" "$MARK_DEC")
       if ip xfrm state 2>/dev/null | grep -q "mark ${mark_hex}"; then
         echo -e "XFRM state: ${GRN}present${NC}"
       elif ip xfrm state 2>/dev/null | grep -qE "src ${LOCAL_WAN_IP}[[:space:]]+dst ${REMOTE_WAN_IP}|src ${REMOTE_WAN_IP}[[:space:]]+dst ${LOCAL_WAN_IP}"; then
