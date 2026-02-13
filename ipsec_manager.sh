@@ -1148,7 +1148,7 @@ local_tun_ip() { echo "${TUN_LOCAL_CIDR%%/*}"; }
 
 print_header() {
   echo -e "${BOLD}============================================================${NC}"
-  echo -e "${BOLD} Force fix policies${NC}  ${DIM}(no logic change, cleaner output)${NC}"
+  echo -e "${BOLD} Force fix policies${NC}"
   echo -e "${BOLD}------------------------------------------------------------${NC}"
   echo -e "${BOLD} Tunnel:${NC} ${tun}"
   echo -e "${BOLD} Public:${NC} ${LOCAL_WAN_IP}  <->  ${REMOTE_WAN_IP}"
